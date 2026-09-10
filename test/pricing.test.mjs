@@ -20,7 +20,7 @@ const { initTheme } = await jiti.import("/usr/local/lib/node_modules/@earendil-w
 initTheme("dark");
 
 const { readPricing, writePricing, seedPricing, updatePricing } = await jiti.import(`${SRC}/pricing-store.ts`);
-const { resolvePricing, listProviderModels, listProviders } = await jiti.import(`${SRC}/pricing-query.ts`);
+const { resolvePricing, createPricingResolver, listProviderModels, listProviders } = await jiti.import(`${SRC}/pricing-query.ts`);
 const { renderPriceList, renderModelDetail, renderSchema } = await jiti.import(`${SRC}/pricing-format.ts`);
 const { listProviderRows, listModelRows } = await jiti.import(`${SRC}/pricing-builder.ts`);
 const { PricingDrawer } = await jiti.import(`${SRC}/pricing-ui.ts`);
@@ -204,6 +204,39 @@ test("query：resolvePricing 未知 model → 兜底价", () => {
 	assert.equal(r.inputHit, 0.02);
 	assert.equal(r.output, 4);
 	assert.equal(r.isPeak, false);
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("query：createPricingResolver 一次读文件、逐条按峰谷解析", () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing({
+		version: 1,
+		providers: {
+			deepseek: {
+				peakHours: { timezone: "Asia/Shanghai", weekdays: [1, 2, 3, 4, 5], ranges: [[9, 12], [14, 18]] },
+				models: {
+					"deepseek-flash": { input: { miss: 1, hit: 0.02 }, output: { standard: 4, peak: 8 } },
+				},
+			},
+		},
+	}, path);
+	const pricing = createPricingResolver(path);
+	// 峰会时段（北京 10:00 2026-09-16 周二）→ 输出 8
+	const peak = pricing("deepseek-flash", "deepseek", new Date("2026-09-16T02:00:00Z"));
+	assert.equal(peak.output, 8);
+	assert.equal(peak.isPeak, true);
+	// 空闲（北京 21:00 周四）→ 输出 4；数字时间戳同样支持
+	const idle = pricing("deepseek-flash", "deepseek", new Date("2026-09-10T13:00:00Z").getTime());
+	assert.equal(idle.output, 4);
+	assert.equal(idle.isPeak, false);
+	// alias 匹配
+	const alias = pricing("deepseek-v4-flash", "deepseek", new Date("2026-09-10T21:00:00Z"));
+	assert.equal(alias.inputHit, 0.02);
+	// 未知 → 兜底
+	const fallback = pricing("nope", "deepseek", new Date("2026-09-10T21:00:00Z"));
+	assert.equal(fallback.output, 4);
+	assert.equal(fallback.inputMiss, 1);
 	rmSync(dir, { recursive: true, force: true });
 });
 

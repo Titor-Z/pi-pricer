@@ -1,6 +1,6 @@
 {
 	"name": "@foolsecret/pi-pricer",
-	"version": "0.2.0",
+	"version": "0.3.0",
 	"description": "Pi 模型计费配置中心 — 共享价格数据 + 可编辑 UI | Shared model pricing config for Pi extensions",
 	"keywords": [
 		"pi-package",
@@ -8,6 +8,12 @@
 	],
 	"type": "module",
 	"main": "./extensions/index.ts",
+	"exports": {
+		".": "./extensions/index.ts",
+		"./pricing": "./src/pricing-query.ts",
+		"./store": "./src/pricing-store.ts",
+		"./types": "./src/pricing-types.ts"
+	},
 	"pi": {
 		"extensions": [
 			"./extensions/index.ts"

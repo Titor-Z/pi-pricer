@@ -64,18 +64,11 @@ function findModel(
 }
 
 /**
- * 根据 model/provider/timestamp 解析真实价格。
+ * 根据 model/provider/timestamp 在给定 schema 上解析真实价格。
  *
- * 解析链：JSON 该 model → JSON provider fallback → 硬编码兜底。
- * 返回值含 isPeak 标记，供调用方判断峰谷。
+ * 解析链：JSON 该 model（alias 匹配）→ 兜底价。
  */
-export function resolvePricing(
-	model: string,
-	provider: string,
-	timestamp?: Date,
-	filePath?: string,
-): ResolvedPrice {
-	const schema = readPricing(filePath);
+function resolveFromSchema(schema: PricingSchema, model: string, provider: string, timestamp?: Date): ResolvedPrice {
 	const providerData = schema.providers[provider];
 
 	// provider 存在 → 尝试匹配 model
@@ -97,6 +90,37 @@ export function resolvePricing(
 
 	// 兜底
 	return { ...FALLBACK };
+}
+
+/**
+ * 根据 model/provider/timestamp 解析真实价格（每次读取一次 JSON 文件）。
+ *
+ * 解析链：JSON 该 model → JSON provider fallback → 硬编码兜底。
+ * 返回值含 isPeak 标记，供调用方判断峰谷。
+ */
+export function resolvePricing(
+	model: string,
+	provider: string,
+	timestamp?: Date,
+	filePath?: string,
+): ResolvedPrice {
+	return resolveFromSchema(readPricing(filePath), model, provider, timestamp);
+}
+
+/**
+ * 批量解析器：一次读取 JSON，返回可复用的 (model, provider, ts) → ResolvedPrice 闭包。
+ *
+ * 供 pi-prompt / pi-usage 的台账成本统计逐条调价时避免反复磁盘 IO（每轮/每条
+ * 记录各取一次价格，不在统计循环里反复 readPricing）。
+ */
+export type PricingResolver = (model: string, provider: string, timestamp?: Date | number) => ResolvedPrice;
+
+export function createPricingResolver(filePath?: string): PricingResolver {
+	const schema = readPricing(filePath);
+	return (model, provider, timestamp) => {
+		const ts = typeof timestamp === "number" ? new Date(timestamp) : timestamp;
+		return resolveFromSchema(schema, model, provider, ts);
+	};
 }
 
 /**

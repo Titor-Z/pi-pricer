@@ -155,10 +155,13 @@ resolvePricing(model, provider, ts)
 四层切分（对齐 pi-prompt 三层范式 + 抽屉表现层）：
 
 - **纯函数层（pricing-query / pricing-store）**：
-  `resolvePricing()` / `readPricing()` / `writePricing()` / `seedPricing()` —— 
-  不依赖 pi ExtensionAPI，node 单测直接断言。
+  `resolvePricing()` / `createPricingResolver()` / `readPricing()` /
+  `writePricing()` / `seedPricing()` —— 不依赖 pi ExtensionAPI，node 单测直接断言。
   `resolvePricing()` 是跨扩展共享的核心 API：输入 (model, provider, timestamp)，
   输出 ResolvedPrice（含 isPeak 标记）。
+  `createPricingResolver()` 是批量变体：一次读取 schema，返回可复用闭包，
+  供台账统计逐条调价避免反复磁盘 IO（pi-prompt 0.3.1 经 npm 子路径
+  `@foolsecret/pi-pricer/pricing` 动态 import 消费）。
 
 - **行折叠层（pricing-builder）**：
   `listProviderRows()` / `listModelRows()` —— 把 JSON 折叠成抽屉行

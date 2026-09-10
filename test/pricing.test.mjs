@@ -7,7 +7,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createJiti } from "/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/jiti/lib/jiti.mjs";
@@ -15,9 +15,16 @@ import { createJiti } from "/usr/local/lib/node_modules/@earendil-works/pi-codin
 const jiti = createJiti(import.meta.url);
 const SRC = "/Users/titor/projects/pi-pricer/src";
 
+// getSettingsListTheme 依赖全局主题单例，先初始化（dark 兜底即可）
+const { initTheme } = await jiti.import("/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/dist/index.js");
+initTheme("dark");
+
 const { readPricing, writePricing, seedPricing, updatePricing } = await jiti.import(`${SRC}/pricing-store.ts`);
 const { resolvePricing, listProviderModels, listProviders } = await jiti.import(`${SRC}/pricing-query.ts`);
 const { renderPriceList, renderModelDetail, renderSchema } = await jiti.import(`${SRC}/pricing-format.ts`);
+const { listProviderRows, listModelRows } = await jiti.import(`${SRC}/pricing-builder.ts`);
+const { PricingDrawer } = await jiti.import(`${SRC}/pricing-ui.ts`);
+const { PricingCommands } = await jiti.import(`${SRC}/pricing-commands.ts`);
 
 function tmpDir() {
 	return mkdtempSync(join(tmpdir(), "pi-pricer-"));
@@ -311,5 +318,217 @@ test("挂载：/price set 修改 JSON → list 反映新值", async () => {
 	// list 渲染包含新价格
 	const text = renderPriceList(path);
 	assert.ok(text.includes("¥99.00"));
+	rmSync(dir, { recursive: true, force: true });
+});
+
+// ── builder 纯函数 ──────────────────────────────────────────────────────
+
+test("builder：listProviderRows 列出厂商与峰时段描述", () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	seedPricing(path);
+	const rows = listProviderRows(path);
+	assert.ok(rows.length >= 2);
+	const ds = rows.find((r) => r.providerId === "deepseek");
+	assert.equal(ds.modelCount, 2);
+	assert.ok(ds.peakDesc.includes("峰"));
+	assert.ok(ds.description.includes("9:00-12:00"));
+	const glm = rows.find((r) => r.providerId === "glm");
+	assert.equal(glm.peakDesc, "无峰时段");
+	assert.ok(glm.description.includes("全天统一价"));
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("builder：listModelRows 列出模型与价格行", () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	seedPricing(path);
+	const rows = listModelRows("deepseek", path);
+	assert.equal(rows.length, 2);
+	const flash = rows.find((r) => r.modelId === "deepseek-flash");
+	assert.equal(flash.alias, "deepseek-v4-flash");
+	assert.ok(flash.outputText.includes("¥4.00→¥8.00")); // 有峰 → 标准→峰
+	assert.ok(flash.inputText.includes("¥1.00"));
+	const pro = rows.find((r) => r.modelId === "deepseek-v4-pro");
+	assert.ok(pro.outputText.includes("¥13.50→¥27.00"));
+	// 未知厂商空数组
+	assert.equal(listModelRows("nope", path).length, 0);
+	rmSync(dir, { recursive: true, force: true });
+});
+
+// ── 抽屉（PricingDrawer）───────────────────────────────────────────────
+
+function drawerCtx() {
+	const ctx = {};
+	const captured = {};
+	ctx.captured = captured;
+	ctx.ui = {
+		custom: async (factory) => {
+			captured.factory = factory;
+		},
+	};
+	return ctx;
+}
+
+/** 运行抽屉工厂拿到可驱动的组件句柄（ANSI 序列用 \x1b 前缀编码） */
+function runDrawer(captured) {
+	assert.ok(captured.factory, "应调用 ctx.ui.custom 开抽屉");
+	const theme = { fg: (color, text) => text, bold: (text) => text };
+	let doneCount = 0;
+	const handle = captured.factory({}, theme, {}, () => { doneCount += 1; });
+	handle.doneCount = () => doneCount;
+	return handle;
+}
+
+/** 提取渲染纯文本（去 ANSI 转义） */
+function plainOf(handle, width = 90) {
+	return handle.render(width).join("\n").replace(/\u001b\[\d+(;\d+)*m/g, "");
+}
+
+test("抽屉：headless（无 custom UI）返回 false", async () => {
+	const ctx = { ui: {} };
+	const drawer = new PricingDrawer();
+	const opened = await drawer.open(ctx);
+	assert.equal(opened, false);
+});
+
+test("抽屉：_open 捕获工厂并渲染厂商列表", async () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	seedPricing(path);
+	const ctx = drawerCtx();
+	const drawer = new PricingDrawer(path);
+	const opened = await drawer.open(ctx);
+	assert.equal(opened, true);
+	const handle = runDrawer(ctx.captured);
+	const out = plainOf(handle);
+	assert.ok(out.includes("模型计费配置 · 厂商"));
+	assert.ok(out.includes("deepseek"));
+	assert.ok(out.includes("glm"));
+	assert.ok(out.includes("无峰时段"));
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("抽屉：Enter 下钻 → Esc 返回，三级钻取闭环", async () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	seedPricing(path);
+	const ctx = drawerCtx();
+	const drawer = new PricingDrawer(path);
+	await drawer.open(ctx);
+	const handle = runDrawer(ctx.captured);
+
+	// 第 0 级厂商列表：Enter 进入 deepseek 模型列表
+	handle.handleInput("\r");
+	const level1 = plainOf(handle);
+	assert.ok(level1.includes("deepseek-flash"), "应显示模型列表");
+	assert.ok(level1.includes("模型计费配置 · deepseek"), "标题应更新为厂商层级");
+	assert.ok(level1.includes("¥4.00→¥8.00"));
+
+	// Esc 返回厂商列表，标题复原
+	handle.handleInput("\x1b");
+	const back0 = plainOf(handle);
+	assert.ok(back0.includes("模型计费配置 · 厂商"), "标题应还原第 0 级");
+
+	// 重新进入，下移到 deepseek-v4-pro，Enter 进入详情页
+	handle.handleInput("\r");
+	handle.handleInput("\x1b[B"); // 第 2 行 → deepseek-v4-pro
+	handle.handleInput("\r");
+	const detail = plainOf(handle);
+	assert.ok(detail.includes("deepseek-v4-pro"));
+	assert.ok(detail.includes("编辑"), "详情页应包含编辑提示");
+	// 详情页无别名 → 不含"别名"字段
+	assert.ok(!detail.includes("别名"));
+
+	// Esc 返回模型列表
+	handle.handleInput("\x1b");
+	const back1 = plainOf(handle);
+	assert.ok(back1.includes("deepseek-flash"), "应回到模型列表");
+	assert.ok(back1.includes("模型计费配置 · deepseek"));
+
+	// Esc 返回厂商列表并关闭（此时触发整体 done）
+	handle.handleInput("\x1b");
+	// 厂商列表 Esc → close 按钮触发 done
+	const backClose = plainOf(handle);
+	assert.ok(backClose.includes("模型计费配置 · 厂商"));
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("抽屉：详情页引用 renderModelDetail 文本", async () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	seedPricing(path);
+	// 直接对比抽屉详情的产物 = /price show 文本主体
+	const ctx = drawerCtx();
+	const drawer = new PricingDrawer(path);
+	await drawer.open(ctx);
+	const handle = runDrawer(ctx.captured);
+	handle.handleInput("\r"); // 进入 deepseek
+	handle.handleInput("\r"); // 首模型 deepseek-flash（有别名）
+	const detail = plainOf(handle);
+	assert.ok(detail.includes("deepseek/deepseek-flash"));
+	assert.ok(detail.includes("别名: deepseek-v4-flash"));
+	assert.ok(detail.includes("峰 ¥8.00/M"));
+	assert.ok(detail.includes("峰 一/二/三/四/五 9-12 / 14-18"));
+	rmSync(dir, { recursive: true, force: true });
+});
+
+// ── /price 命令接线 ─────────────────────────────────────────────────────
+
+/** mock 的 ExtensionContext：只够 /price handler 跑的最小形状 */
+function cmdCtx({ withCustom = true } = {}) {
+	const notifications = [];
+	const captured = {};
+	return {
+		ui: {
+			notify: (text) => notifications.push(text),
+			custom: async (factory) => {
+				captured.factory = factory;
+			},
+			theme: { fg: (color, text) => text, bold: (text) => text },
+		},
+		notifications,
+		captured,
+		withCustom,
+	};
+}
+
+/** mock 的 ExtensionAPI：记录注册的命令与事件 */
+function cmdPi() {
+	const commands = new Map();
+	return {
+		registerCommand: (name, options) => commands.set(name, options),
+		commands,
+	};
+}
+
+test("挂载：/price 无参在 TUI 下打开抽屉", async () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	seedPricing(path);
+	const pi = cmdPi();
+	const ctx = cmdCtx({ withCustom: true });
+	const mounted = new PricingCommands(path);
+	mounted.mount(pi);
+	const handler = pi.commands.get("price").handler;
+	await handler("", ctx);
+	assert.ok(ctx.captured.factory, "无参应调用 ctx.ui.custom 开抽屉");
+	assert.equal(ctx.notifications.length, 0, "抽屉模式下不应 notify 文本");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("挂载：/price 无参在 headless 下回退文本 list", async () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	const ctx = cmdCtx({ withCustom: false });
+	// headless：ui.custom 不存在
+	ctx.ui = { notify: ctx.ui.notify };
+	const pi = cmdPi();
+	const mounted = new PricingCommands(path);
+	mounted.mount(pi);
+	const handler = pi.commands.get("price").handler;
+	await handler("", ctx);
+	assert.equal(ctx.captured.factory, undefined, "headless 不应开抽屉");
+	assert.ok(ctx.notifications.some((t) => t.includes("deepseek")), "headless 应通知文本表格");
 	rmSync(dir, { recursive: true, force: true });
 });

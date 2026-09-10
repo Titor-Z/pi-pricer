@@ -57,17 +57,21 @@ Pi 生态的模型计费数据共享中心。解决"厂商调价频繁，硬编�
 - 每行：`<provider-id>  (<N>模型 · <峰时段描述>)`
 - 说明栏：该厂商的计费参数与峰时段规则概述
 - Enter → 下钻 Model List
+- 实现：每行 SettingItem 带 `submenu`，Enter 用 SettingsList 原生 submenu 机制
+  打开第 1 级；标题 Text.setText 随层级更新（"模型计费配置 · <provider>"）
 
 ### Model List（Level 1）
 - SettingsList 展示当前厂商下的所有模型
 - 每行：`<model-id>  out ¥4.00→¥8.00 · miss ¥1.00 hit ¥0.02`
 - 说明栏：该模型的输入价概述
 - Enter → 下钻 Model Detail
+- Esc → 返回 Provider List（子级 SettingsList 的 onCancel 调外层 done，恢复父级选中 +
+  标题还原）
 
 ### Model Detail（Level 2）
 - 纯文本渲染（非 SettingsList，因为不需要循环交互）
 - 显示：别名 / 输入 miss+hit / 输出 std+peak / 峰时段 / 编辑命令提示
-- Esc → 返回 Model List
+- handleInput 只拦截 Esc → 返回 Model List（恢复第 1 级标题）
 
 ## Interaction
 
@@ -148,7 +152,7 @@ resolvePricing(model, provider, ts)
 
 ## Module Design
 
-三层切分（与 pi-prompt 一致）：
+四层切分（对齐 pi-prompt 三层范式 + 抽屉表现层）：
 
 - **纯函数层（pricing-query / pricing-store）**：
   `resolvePricing()` / `readPricing()` / `writePricing()` / `seedPricing()` —— 
@@ -156,13 +160,18 @@ resolvePricing(model, provider, ts)
   `resolvePricing()` 是跨扩展共享的核心 API：输入 (model, provider, timestamp)，
   输出 ResolvedPrice（含 isPeak 标记）。
 
-- **格式化层（pricing-format）**：
-  `renderPriceList()` / `renderModelDetail()` / `renderSchema()` —— 
-  纯文本渲染，无 TUI 依赖，node 单测断言输出字符串。
+- **行折叠层（pricing-builder）**：
+  `listProviderRows()` / `listModelRows()` —— 把 JSON 折叠成抽屉行
+  （ProviderRow / ModelRow），TUI 无关，node 单测直接断言行内容。
+
+- **格式化层（pricing-format / pricing-ui）**：
+  文本渲染 `renderPriceList()` / `renderModelDetail()` / `renderSchema()`（纯函数）；
+  抽屉 `PricingDrawer`（表现层，消费 builder 行构建 SettingsList + submenu 下钻，
+  filePath 注入可测，不访问 ExtensionAPI）。
 
 - **接线层（pricing-commands）**：
-  PricingCommands.mount(pi) 注册 `/price` 命令，连接 command → store + format；
-  首次启动 seeding。DI 可测。
+  PricingCommands.mount(pi) 注册 `/price` 命令，无参 → drawer.open(ctx)（headless
+  返回 false → 回退 /price list 文本）；首次启动 seeding。DI 可测。
 
 ## Do's and Don'ts
 

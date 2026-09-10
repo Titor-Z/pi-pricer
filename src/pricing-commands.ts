@@ -1,12 +1,14 @@
 /**
- * /price 命令实现：list / set / schema / reload。
+ * /price 命令实现：无参开三级钻取抽屉 / list / show / set / schema / reload。
  *
- * 接线层：连接 pi.registerCommand → pricing-store + pricing-query + pricing-format。
+ * 接线层：连接 pi.registerCommand → pricing-ui（TUI 抽屉）+ pricing-store +
+ * pricing-query + pricing-format。
  */
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { seedPricing, readPricing, updatePricing } from "./pricing-store.ts";
 import { renderPriceList, renderModelDetail, renderSchema } from "./pricing-format.ts";
+import { PricingDrawer } from "./pricing-ui.ts";
 import type { ModelPricing, PricingSchema } from "./pricing-types.ts";
 
 /** 格式化价格值：支持 "4"、"4.5"、"¥4" 等输入 → 解析为 number */
@@ -39,16 +41,28 @@ function setModelField(mp: ModelPricing, group: "input" | "output", key: string,
 }
 
 export class PricingCommands {
+	private readonly drawer: PricingDrawer;
+
+	/** filePath 注入便于单测隔离（默认读 ~/.pi/model-pricing.json） */
+	constructor(filePath?: string) {
+		this.drawer = new PricingDrawer(filePath);
+	}
+
 	mount(pi: ExtensionAPI): void {
 		seedPricing();
 
 		pi.registerCommand("price", {
-			description: "模型计费配置：查看与编辑 /price list|set|schema|reload",
+			description: "模型计费配置：无参开抽屉 / list|show|set|schema|reload",
 			handler: async (args: string, ctx: ExtensionCommandContext) => {
 				const parts = args.trim().split(/\s+/);
-				const sub = parts[0] ?? "list";
+				const sub = parts[0] ?? "";
 
 				switch (sub) {
+					case "":
+						// 无参：TUI 下开三级钻取抽屉；headless 回退文本表格
+						if (await this.drawer.open(ctx)) break;
+						ctx.ui.notify(renderPriceList(), "info");
+						break;
 					case "list":
 						ctx.ui.notify(renderPriceList(), "info");
 						break;

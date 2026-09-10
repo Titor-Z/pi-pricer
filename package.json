@@ -1,0 +1,34 @@
+{
+	"name": "@foolsecret/pi-pricer",
+	"version": "0.1.0",
+	"description": "Pi 模型计费配置中心 — 共享价格数据 + 可编辑 UI | Shared model pricing config for Pi extensions",
+	"keywords": [
+		"pi-package",
+		"pi-extension"
+	],
+	"type": "module",
+	"main": "./extensions/index.ts",
+	"pi": {
+		"extensions": [
+			"./extensions/index.ts"
+		]
+	},
+	"files": [
+		"src/",
+		"extensions/",
+		"package.json",
+		"README.md"
+	],
+	"scripts": {
+		"typecheck": "tsc --noEmit",
+		"test": "node --test --test-force-exit \"test/**/*.test.mjs\""
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*"
+	},
+	"devDependencies": {
+		"typescript": "^5.0.0",
+		"@types/node": "*"
+	}
+}

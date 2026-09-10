@@ -150,31 +150,87 @@ resolvePricing(model, provider, ts)
   → JSON 没有 → 硬编码兜底 { miss:1, hit:0.02, output:4 }
 ```
 
+## Data Schema（JSON v2）
+
+v1 每个模型一份价格、厂商共享峰时段；v2 拆成**五注册表原子模型**，
+让"时段 × 价格"可复用、可任意组合：
+
+- **calendars**：节假日/特殊日期表（`dates` 支持 "YYYY-MM-DD" 精确日期 +
+  "MM-DD" 每年循环），方案 schedule 通过 `calendar` + `calendarMode`（include/exclude）
+  引用
+- **prices**：价格实体（`input.miss/hit` + `output`），可被多个方案规则复用
+- **plans**：命名方案（时段规则集合），`rules[].schedule` 定义生效时间窗，
+  `rules[].price` 指向价格实体；规则支持 includeDates / excludeDates /
+  validUntil（"YYYY-MM-DD"，到期自动停用）
+- **providers → models**：模型 `plans[]` 绑定一个或多个方案
+  （`enabled` 可浮点开关；数组**顺序即优先级**，首位优先）
+- 统一 schedule：`timezone` + `weekdays`（1-7）+ `ranges`（[start,end) 半开，
+  跨午夜拆两段）；`weekdays:[]` + `ranges:[]` + 无日历/日期 = **总是命中**（基准档）
+
+### Resolution 契约
+
+```
+resolvePricing(model, provider, ts)
+  → 过滤：绑定 enabled=false → 跳过；方案规则 validUntil 到期 → 跳过
+  → 按绑定数组顺序逐方案：schedule 命中（日期/星期/时间窗）→ 该规则价格即结果
+  → 全部未命中 → 兜底价 { miss:1, hit:0.02, output:4 }
+```
+
+- **first match wins**：无聚合、无叠加，唯一命中即结果；exclusion 用
+  "更高优先级规则先命中"表达，不设 exclude 规则类型
+- schedule 排除优先级：excludeDates / calendar-exclude → calendar-include →
+  includeDates → 周规则（weekdays ∩ ranges）；日历/日期命中时忽略周规则
+- `ResolvedPrice` 形保持 v1 不变（`inputMiss/inputHit/output/isPeak`），
+  `isPeak` 语义改为"命中的规则是时段限定"（非恒真峰谷）
+- v1 文件读取时**自动迁移**（按价格形状去重生成 peak/valley 方案与价格实体，
+  同价模型共享同一组方案；v1 峰输入价未存 → 沿用谷输入价，可手动补真实峰值）
+
+```jsonc
+{ "version": 2,
+  "calendars": { "holidays": { "name": "节假日", "dates": ["2026-10-01", "01-01"], "ranges": null } },
+  "prices":   { "deepseek-peak":  { "name": "DeepSeek 峰价", "input": {"miss":2,"hit":0.04}, "output": 8 } },
+  "plans":    { "deepseek-peak-workday": { "name": "工作日高峰",
+                "rules": [ { "schedule": { "timezone": "Asia/Shanghai", "weekdays": [1,2,3,4,5],
+                            "ranges": [["09:00","12:00"],["14:00","18:00"]] }, "price": "deepseek-peak" } ] } },
+  "providers": { "deepseek": { "models": { "deepseek-flash": { "alias": "deepseek-v4-flash",
+                "plans": [ { "plan": "deepseek-peak-workday", "enabled": true },
+                           { "plan": "deepseek-valley-always", "enabled": true } ] } } } } }
+```
+
 ## Module Design
 
 四层切分（对齐 pi-prompt 三层范式 + 抽屉表现层）：
 
-- **纯函数层（pricing-query / pricing-store）**：
-  `resolvePricing()` / `createPricingResolver()` / `readPricing()` /
-  `writePricing()` / `seedPricing()` —— 不依赖 pi ExtensionAPI，node 单测直接断言。
+- **纯函数层（pricing-query / pricing-store / pricing-desc）**：
+  `resolvePricing()` / `createPricingResolver()` / `resolveDebug()` /
+  `readPricing()` / `writePricing()` / `seedPricing()` / `migrateV1ToV2()` ——
+  不依赖 pi ExtensionAPI，node 单测直接断言。
   `resolvePricing()` 是跨扩展共享的核心 API：输入 (model, provider, timestamp)，
-  输出 ResolvedPrice（含 isPeak 标记）。
+  输出 ResolvedPrice（含 isPeak 标记），v2 后签名与输出形状不变。
   `createPricingResolver()` 是批量变体：一次读取 schema，返回可复用闭包，
   供台账统计逐条调价避免反复磁盘 IO（pi-prompt 0.3.1 经 npm 子路径
   `@foolsecret/pi-pricer/pricing` 动态 import 消费）。
+  `resolveDebug()` 输出解析链（每步方案名/是否命中/未中原因），
+  `/price resolve` 与抽屉详情页共用，是 v2 first-match 语义的可视化窗口。
+  `pricing-desc` 提供价目/星期/时段的共享中文文案（price / weekdaysCn / rangesCn）。
 
 - **行折叠层（pricing-builder）**：
-  `listProviderRows()` / `listModelRows()` —— 把 JSON 折叠成抽屉行
-  （ProviderRow / ModelRow），TUI 无关，node 单测直接断言行内容。
+  `listProviderRows()` / `listModelRows()` —— 把 v2 五注册表折叠成抽屉行
+  （ProviderRow / ModelRow：planDesc / liveOutput / timeState / boundCount /
+  enabledCount / priceLines），TUI 无关，node 单测直接断言行内容。
 
 - **格式化层（pricing-format / pricing-ui）**：
-  文本渲染 `renderPriceList()` / `renderModelDetail()` / `renderSchema()`（纯函数）；
+  文本渲染 `renderPriceList()` / `renderModelDetail()` / `renderSchema()` /
+  `renderPlanList()` / `renderPlanDetail()` / `renderPriceRegistry()` /
+  `renderCalendarList()` / `renderResolveResult()`（纯函数）；
   抽屉 `PricingDrawer`（表现层，消费 builder 行构建 SettingsList + submenu 下钻，
   filePath 注入可测，不访问 ExtensionAPI）。
 
 - **接线层（pricing-commands）**：
   PricingCommands.mount(pi) 注册 `/price` 命令，无参 → drawer.open(ctx)（headless
-  返回 false → 回退 /price list 文本）；首次启动 seeding。DI 可测。
+  返回 false → 回退 /price list 文本）；子命令 list/model/plan/price/calendar/
+  resolve/bind/unbind/schema 全部经注入 filePath 读写，首次启动 seedPricing。
+  DI 可测。
 
 ## Do's and Don'ts
 

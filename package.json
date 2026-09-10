@@ -1,6 +1,6 @@
 {
 	"name": "@foolsecret/pi-pricer",
-	"version": "0.3.0",
+	"version": "0.4.0",
 	"description": "Pi 模型计费配置中心 — 共享价格数据 + 可编辑 UI | Shared model pricing config for Pi extensions",
 	"keywords": [
 		"pi-package",

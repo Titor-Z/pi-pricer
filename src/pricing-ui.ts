@@ -78,7 +78,7 @@ export class PricingDrawer {
 		const rows = listProviderRows(this.filePath);
 		const items: SettingItem[] = rows.map((row) => ({
 			id: row.providerId,
-			label: `${row.providerId}  (${row.modelCount}模型 · ${row.peakDesc})`,
+			label: `${row.providerId}  (${row.modelCount}模型 · ${row.planDesc})`,
 			currentValue: "",
 			description: row.description,
 			submenu: (_currentValue, done) => {
@@ -109,7 +109,7 @@ export class PricingDrawer {
 		const rows = listModelRows(providerId, this.filePath);
 		const items: SettingItem[] = rows.map((row) => ({
 			id: row.modelId,
-			label: `${row.modelId}  out ${row.outputText} · miss ${row.inputText}`,
+			label: `${row.modelId}  当前 ${row.liveOutput} · ${row.timeState} · ${row.enabledCount}/${row.boundCount} 档`,
 			currentValue: "",
 			description: row.description,
 			submenu: (_currentValue, done) => {

@@ -1,19 +1,19 @@
 /**
- * 纯函数层：把 JSON 价格数据折叠成抽屉行（ProviderRow / ModelRow）。
- *
- * TUI 无关，node 单测直接断言；表现层（PricingDrawer）消费这些行构建
- * SettingsList 的 SettingItem，接线层只负责"命令 → 打开抽屉"。
+ * 纯函数层：把 v2 数据折叠成抽屉/列表行（ProviderRow / ModelRow）。
+ * TUI 无关，node 单测直接断言；表现层与格式化层消费。
  */
 
 import { readPricing } from "./pricing-store.ts";
-import { listProviders } from "./pricing-query.ts";
-import type { PeakHours } from "./pricing-types.ts";
+import { listProviderModels, listProviders } from "./pricing-query.ts";
+import { describeSchedule, price } from "./pricing-desc.ts";
+import type { PricingRule, Schedule } from "./pricing-types.ts";
 
 /** 抽屉第 0 级（厂商列表）的一行数据 */
 export interface ProviderRow {
 	providerId: string;
 	modelCount: number;
-	peakDesc: string;
+	/** 厂商绑定的方案名摘要（如 "工作日高峰 · 全时谷价"） */
+	planDesc: string;
 	description: string;
 }
 
@@ -21,22 +21,30 @@ export interface ProviderRow {
 export interface ModelRow {
 	modelId: string;
 	alias?: string;
-	outputText: string;
-	inputText: string;
+	/** 实时生效输出价（"¥4.00"） */
+	liveOutput: string;
+	/** 实时生效输入价（"未缓存 ¥1.00 / 缓存 ¥0.02"） */
+	liveInputText: string;
+	/** 实时时段状态（"普通时段" / "高峰时段"） */
+	timeState: string;
+	/** 绑定方案数 / 启用数 */
+	boundCount: number;
+	enabledCount: number;
+	/** 每条启用规则的价目行（谷/峰排列） */
+	priceLines: string[];
 	description: string;
 }
 
-/** 格式化单个价格（¥1 → "¥1.00"；¥0.02 → "¥0.02"） */
-function price(n: number): string {
-	return `¥${n.toFixed(2)}`;
+/** 规则是否"永远匹配"（weekdays/ranges 空 且无日历/日期覆盖） */
+export function isAlwaysRule(rule: PricingRule): boolean {
+	const s = rule.schedule;
+	return s.weekdays.length === 0 && s.ranges.length === 0 &&
+		!s.calendar && !s.includeDates && !s.excludeDates;
 }
 
-/** 峰时段描述（如 "峰 一二三四五 9-12 / 14-18"；无峰 → "无峰时段"） */
-function formatPeakDesc(peakHours: PeakHours | null): string {
-	if (!peakHours) return "无峰时段";
-	const days = peakHours.weekdays.map((d) => ["一", "二", "三", "四", "五", "六", "日"][d - 1]).join("");
-	const ranges = peakHours.ranges.map(([s, e]) => `${s}-${e}`).join(" / ");
-	return `峰 ${days} ${ranges}`;
+/** 格式化一条规则的中文摘要（"工作日 09:00-12:00 / 14:00-18:00"、"全天"） */
+export function describeRule(rule: PricingRule): string {
+	return describeSchedule(rule.schedule);
 }
 
 /** 列出抽屉第 0 级所需的所有厂商行 */
@@ -48,15 +56,28 @@ export function listProviderRows(filePath?: string): ProviderRow[] {
 	for (const providerId of providers) {
 		const prov = schema.providers[providerId];
 		const modelCount = Object.keys(prov?.models ?? {}).length;
-		const peakDesc = formatPeakDesc(prov?.peakHours ?? null);
-		const rangesDesc = prov?.peakHours
-			? `工作日 ${prov.peakHours.weekdays.map((d) => ["一", "二", "三", "四", "五", "六", "日"][d - 1]).join("/")} ${prov.peakHours.ranges.map(([s, e]) => `${s}:00-${e}:00`).join(" / ")}（${prov.peakHours.timezone}）`
-			: "全天统一价";
+		// 收集该厂商所有模型绑定的方案（去重，保持出现顺序）
+		const planIds: string[] = [];
+		for (const conf of Object.values(prov?.models ?? {})) {
+			for (const b of conf.plans) {
+				if (!planIds.includes(b.plan)) planIds.push(b.plan);
+			}
+		}
+		const planNames = planIds.map((id) => schema.plans[id]?.name ?? id).join(" · ");
+		// 各方案规则的中文摘要（去重）
+		const descs: string[] = [];
+		for (const id of planIds) {
+			const plan = schema.plans[id];
+			for (const rule of plan?.rules ?? []) {
+				const d = describeRule(rule);
+				if (!descs.includes(d)) descs.push(d);
+			}
+		}
 		rows.push({
 			providerId,
 			modelCount,
-			peakDesc,
-			description: `${providerId}：${modelCount} 个模型 · ${rangesDesc} · 输入输出均按 JSON 价表计费`,
+			planDesc: planNames,
+			description: `${providerId}：${modelCount} 个模型 · 方案 ${planNames || "（无）"} · ${descs.join(" / ") || "无峰时段"}`,
 		});
 	}
 	return rows;
@@ -64,24 +85,25 @@ export function listProviderRows(filePath?: string): ProviderRow[] {
 
 /** 列出抽屉第 1 级（指定厂商下）所需的所有模型行 */
 export function listModelRows(provider: string, filePath?: string): ModelRow[] {
-	const schema = readPricing(filePath);
-	const prov = schema.providers[provider];
-	if (!prov) return [];
-
-	const hasPeak = prov.peakHours !== null;
-	const rows: ModelRow[] = [];
-	const modelIds = Object.keys(prov.models);
-	for (const modelId of modelIds) {
-		const mp = prov.models[modelId];
-		rows.push({
-			modelId,
-			alias: mp.alias,
-			outputText: hasPeak && mp.output.peak !== null
-				? `${price(mp.output.standard)}→${price(mp.output.peak)}`
-				: price(mp.output.standard),
-			inputText: `${price(mp.input.miss)} / ${price(mp.input.hit)}`,
-			description: `${modelId}${mp.alias ? `（别名 ${mp.alias}）` : ""}：输出 ${mp.output.peak !== null ? `标准 ${price(mp.output.standard)} · 峰 ${price(mp.output.peak)}` : price(mp.output.standard)}/M token · 输入 miss ${price(mp.input.miss)} · hit ${price(mp.input.hit)} · /price set ${provider} ${modelId} <field> <value> 编辑`,
-		});
-	}
-	return rows;
+	const infos = listProviderModels(provider, undefined, filePath);
+	return infos.map((info) => {
+		const enabled = info.planBindings.filter((b) => b.enabled);
+		const live = info.livePrice;
+		const priceLines: string[] = [];
+		for (const planName of enabled.map((b) => b.planName)) priceLines.push(`  当前生效 ${planName}`);
+		return {
+			modelId: info.model,
+			alias: info.alias,
+			liveOutput: price(live.output),
+			liveInputText: `未缓存 ${price(live.inputMiss)} / 缓存 ${price(live.inputHit)}`,
+			timeState: live.isPeak ? "高峰时段" : "普通时段",
+			boundCount: info.planBindings.length,
+			enabledCount: enabled.length,
+			priceLines,
+			description: `${info.model}${info.alias ? `（别名 ${info.alias}）` : ""}：绑定 ${info.planBindings.map((b) => `${b.planName}${b.enabled ? "" : "〔禁用〕"}`).join("、")} · 当前 ${price(live.output)}${live.isPeak ? "（高峰时段）" : ""}`,
+		};
+	});
 }
+
+export { describeSchedule };
+export type { Schedule };

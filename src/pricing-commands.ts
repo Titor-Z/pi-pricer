@@ -1,15 +1,26 @@
 /**
- * /price 命令实现：无参开三级钻取抽屉 / list / show / set / schema / reload。
+ * /price 命令实现：v2 五注册表浏览 + 绑定管理 + 调试。
  *
- * 接线层：连接 pi.registerCommand → pricing-ui（TUI 抽屉）+ pricing-store +
- * pricing-query + pricing-format。
+ * 接线层：pi.registerCommand → pricing-ui（抽屉）+ pricing-store +
+ * pricing-query + pricing-format。编辑主链路在 TUI 抽屉（M2/M3），
+ * CLI 保留查询/绑定/兜底操作。
  */
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { seedPricing, readPricing, updatePricing } from "./pricing-store.ts";
-import { renderPriceList, renderModelDetail, renderSchema } from "./pricing-format.ts";
+import { seedPricing, updatePricing, checkPlanDeletable, checkPriceDeletable } from "./pricing-store.ts";
+import { listProviders } from "./pricing-query.ts";
+import {
+	renderPriceList,
+	renderModelDetail,
+	renderSchema,
+	renderPlanList,
+	renderPlanDetail,
+	renderPriceRegistry,
+	renderCalendarList,
+	renderResolveResult,
+	renderHelp,
+} from "./pricing-format.ts";
 import { PricingDrawer } from "./pricing-ui.ts";
-import type { ModelPricing, PricingSchema } from "./pricing-types.ts";
 
 /** 格式化价格值：支持 "4"、"4.5"、"¥4" 等输入 → 解析为 number */
 function parsePriceValue(raw: string): number | null {
@@ -19,24 +30,18 @@ function parsePriceValue(raw: string): number | null {
 	return num;
 }
 
-/** 解析 field 路径：如 "output.standard" → ["output", "standard"]；无效返回 null */
-function parseFieldPath(field: string): ["input" | "output", string] | null {
-	const validPaths: Record<string, ["input" | "output", string]> = {
-		"input.miss": ["input", "miss"],
-		"input.hit": ["input", "hit"],
-		"output.standard": ["output", "standard"],
-		"output.peak": ["output", "peak"],
-	};
-	return validPaths[field] ?? null;
+/** 解析价格字段路径：input.miss / input.hit / output */
+function parsePriceField(field: string): "input.miss" | "input.hit" | "output" | null {
+	if (field === "input.miss" || field === "input.hit" || field === "output") return field;
+	return null;
 }
 
-/** 设置 ModelPricing 的嵌套字段值 */
-function setModelField(mp: ModelPricing, group: "input" | "output", key: string, value: number): void {
-	switch (`${group}.${key}`) {
-		case "input.miss": mp.input.miss = value; break;
-		case "input.hit": mp.input.hit = value; break;
-		case "output.standard": mp.output.standard = value; break;
-		case "output.peak": mp.output.peak = value; break;
+/** 修改价格实体字段值 */
+function setPriceField(p: { input: { miss: number; hit: number }; output: number }, field: "input.miss" | "input.hit" | "output", value: number): void {
+	switch (field) {
+		case "input.miss": p.input.miss = value; break;
+		case "input.hit": p.input.hit = value; break;
+		case "output": p.output = value; break;
 	}
 }
 
@@ -44,106 +49,198 @@ export class PricingCommands {
 	private readonly drawer: PricingDrawer;
 
 	/** filePath 注入便于单测隔离（默认读 ~/.pi/model-pricing.json） */
+	private readonly filePath?: string;
+
 	constructor(filePath?: string) {
+		this.filePath = filePath;
 		this.drawer = new PricingDrawer(filePath);
 	}
 
 	mount(pi: ExtensionAPI): void {
-		seedPricing();
+		seedPricing(this.filePath);
 
 		pi.registerCommand("price", {
-			description: "模型计费配置：无参开抽屉 / list|show|set|schema|reload",
+			description: "模型计费（v2 五注册表）：无参开抽屉 | model|plan|price|calendar|resolve|bind|unbind|schema|list|help",
 			handler: async (args: string, ctx: ExtensionCommandContext) => {
 				const parts = args.trim().split(/\s+/);
 				const sub = parts[0] ?? "";
 
 				switch (sub) {
 					case "":
-						// 无参：TUI 下开三级钻取抽屉；headless 回退文本表格
+						// 无参：TUI 下开抽屉（模型面）；headless 回退文本总览
 						if (await this.drawer.open(ctx)) break;
-						ctx.ui.notify(renderPriceList(), "info");
+						ctx.ui.notify(renderPriceList(this.filePath), "info");
 						break;
 					case "list":
-						ctx.ui.notify(renderPriceList(), "info");
+						ctx.ui.notify(renderPriceList(this.filePath), "info");
 						break;
-					case "show":
-						if (!parts[1] || !parts[2]) {
-							ctx.ui.notify("用法: /price show <provider> <model>", "info");
-							break;
-						}
-						ctx.ui.notify(renderModelDetail(parts[1], parts[2]), "info");
+					case "help":
+						ctx.ui.notify(renderHelp(), "info");
 						break;
-					case "set":
-						this.setModel(parts[1], parts[2], parts[3], parts[4], ctx);
+					case "model":
+						this.showModel(parts[1], parts[2], ctx);
+						break;
+					case "plan":
+						this.showPlan(parts[1], ctx);
+						break;
+					case "price":
+						this.priceOp(parts[1], parts[2], parts[3], parts[4], ctx);
+						break;
+					case "calendar":
+						ctx.ui.notify(renderCalendarList(this.filePath), "info");
+						break;
+					case "resolve":
+						this.resolve(parts[1], parts[2], parts[3], ctx);
+						break;
+					case "bind":
+						this.bindModel(parts[1], parts[2], parts[3], ctx);
+						break;
+					case "unbind":
+						this.unbindModel(parts[1], parts[2], parts[3], ctx);
 						break;
 					case "schema":
 						ctx.ui.notify(renderSchema(), "info");
 						break;
-					case "reload":
-						this.reload(ctx);
-						break;
 					default:
-						ctx.ui.notify("用法: /price [list|show|set|schema|reload]", "info");
+						ctx.ui.notify(renderHelp(), "info");
 				}
 			},
 		});
 	}
 
-	private setModel(
-		provider: string | undefined,
-		model: string | undefined,
-		field: string | undefined,
-		value: string | undefined,
-		ctx: ExtensionCommandContext,
-	): void {
-		if (!provider || !model || !field || !value) {
-			ctx.ui.notify("用法: /price set <provider> <model> <field> <value>\n  field: input.miss / input.hit / output.standard / output.peak\n  例: /price set deepseek deepseek-flash output.standard 4.5", "info");
+	private showModel(provider: string | undefined, model: string | undefined, ctx: ExtensionCommandContext): void {
+		if (!provider || !model) {
+			ctx.ui.notify("用法: /price model <provider> <model>", "info");
 			return;
 		}
+		ctx.ui.notify(renderModelDetail(provider, model, this.filePath), "info");
+	}
 
-		const fieldPath = parseFieldPath(field);
-		if (!fieldPath) {
-			ctx.ui.notify(`无效字段: ${field}\n可用字段: input.miss / input.hit / output.standard / output.peak`, "info");
+	private showPlan(planId: string | undefined, ctx: ExtensionCommandContext): void {
+		if (!planId) {
+			ctx.ui.notify(renderPlanList(this.filePath), "info");
 			return;
 		}
+		ctx.ui.notify(renderPlanDetail(planId, this.filePath), "info");
+	}
 
-		const priceValue = parsePriceValue(value);
-		if (priceValue === null) {
-			ctx.ui.notify(`无效价格: ${value}\n请输入非负数字（如 4、4.5、¥0.02）`, "info");
+	private priceOp(op: string | undefined, id: string | undefined, field: string | undefined, value: string | undefined, ctx: ExtensionCommandContext): void {
+		switch (op) {
+			case "set":
+				this.setPrice(id, field, value, ctx);
+				break;
+			case "delete":
+				this.deletePrice(id, ctx);
+				break;
+			default:
+				ctx.ui.notify(renderPriceRegistry(this.filePath), "info");
+				break;
+		}
+	}
+
+	private setPrice(priceId: string | undefined, field: string | undefined, value: string | undefined, ctx: ExtensionCommandContext): void {
+		if (!priceId || !field || !value) {
+			ctx.ui.notify("用法: /price price set <price-id> <input.miss|input.hit|output> <value>\n  例: /price price set deepseek-peak input.miss 2", "info");
 			return;
 		}
-
-		const [group, key] = fieldPath;
-		let updated: PricingSchema;
+		const f = parsePriceField(field);
+		if (!f) {
+			ctx.ui.notify(`无效字段: ${field}（可用 input.miss / input.hit / output）`, "info");
+			return;
+		}
+		const v = parsePriceValue(value);
+		if (v === null) {
+			ctx.ui.notify(`无效价格: ${value}（非负数字，如 4、4.5、¥0.02）`, "info");
+			return;
+		}
 		try {
-			updated = updatePricing((data) => {
-				const prov = data.providers[provider!];
-				if (!prov) throw new Error(`未知厂商: ${provider}`);
-				if (!(model! in prov.models)) throw new Error(`${provider} 下未找到模型: ${model}`);
-				setModelField(prov.models[model!], group, key, priceValue);
+			updatePricing((data) => {
+				const p = data.prices[priceId!];
+				if (!p) throw new Error(`未找到价格实体: ${priceId}`);
+				setPriceField(p, f, v);
 				return data;
-			});
+			}, this.filePath);
 		} catch (err) {
 			ctx.ui.notify(`修改失败: ${(err as Error).message}`, "info");
 			return;
 		}
-
-		const mp = updated.providers[provider]?.models[model!];
-		let actualVal: number | null = null;
-		if (mp) {
-			if (group === "input") actualVal = mp.input[key as "miss" | "hit"];
-			else actualVal = mp.output[key as "standard" | "peak"];
-		}
-		ctx.ui.notify(`已修改: ${provider}/${model} ${field} = ${actualVal}\n/price reload 重载生效`, "info");
+		ctx.ui.notify(`已修改价格 ${priceId} ${f} = ${v}（/price price 查看）`, "info");
 	}
 
-	private reload(ctx: ExtensionCommandContext): void {
-		const data = readPricing();
-		const modelCount = Object.values(data.providers).reduce(
-			(sum, p) => sum + Object.keys(p.models).length,
-			0,
-		);
-		const provCount = Object.keys(data.providers).length;
-		ctx.ui.notify(`已重载: ${provCount} 厂商 · ${modelCount} 模型 · schema v${data.version}\n/price list 查看`, "info");
+	private deletePrice(priceId: string | undefined, ctx: ExtensionCommandContext): void {
+		if (!priceId) {
+			ctx.ui.notify("用法: /price price delete <price-id>", "info");
+			return;
+		}
+		try {
+			updatePricing((data) => {
+				const guard = checkPriceDeletable(data, priceId!);
+				if (!guard.ok) throw new Error(guard.reason);
+				delete data.prices[priceId!];
+				return data;
+			}, this.filePath);
+		} catch (err) {
+			ctx.ui.notify(`删除失败: ${(err as Error).message}`, "info");
+			return;
+		}
+		ctx.ui.notify(`已删除价格实体 ${priceId}`, "info");
+	}
+
+	private resolve(model: string | undefined, provider: string | undefined, ts: string | undefined, ctx: ExtensionCommandContext): void {
+		if (!model) {
+			ctx.ui.notify("用法: /price resolve <model> [provider] [YYYY-MM-DDTHH:mm]\n  例: /price resolve deepseek-flash deepseek 2026-09-16T10:00", "info");
+			return;
+		}
+		const providers = listProviders(this.filePath);
+		const prov = provider ?? providers[0] ?? "deepseek";
+		let date: Date | undefined;
+		if (ts) {
+			date = new Date(ts.includes("T") ? ts : `${ts}T12:00:00`);
+			if (Number.isNaN(date.getTime())) date = undefined;
+		}
+		ctx.ui.notify(renderResolveResult(model, prov, date, this.filePath), "info");
+	}
+
+	private bindModel(provider: string | undefined, model: string | undefined, plan: string | undefined, ctx: ExtensionCommandContext): void {
+		if (!provider || !model || !plan) {
+			ctx.ui.notify("用法: /price bind <provider> <model> <plan-id>", "info");
+			return;
+		}
+		try {
+			updatePricing((data) => {
+				const conf = data.providers[provider!]?.models[model!];
+				if (!conf) throw new Error(`未找到模型: ${provider}/${model}`);
+				if (!data.plans[plan!]) throw new Error(`未找到方案: ${plan}`);
+				const existing = conf.plans.find((b) => b.plan === plan!);
+				if (existing) existing.enabled = true;
+				else conf.plans.push({ plan: plan!, enabled: true });
+				return data;
+			}, this.filePath);
+		} catch (err) {
+			ctx.ui.notify(`绑定失败: ${(err as Error).message}`, "info");
+			return;
+		}
+		ctx.ui.notify(`已绑定 ${provider}/${model} → ${plan}（排最后=最低优先级；/price model 查看）`, "info");
+	}
+
+	private unbindModel(provider: string | undefined, model: string | undefined, plan: string | undefined, ctx: ExtensionCommandContext): void {
+		if (!provider || !model || !plan) {
+			ctx.ui.notify("用法: /price unbind <provider> <model> <plan-id>", "info");
+			return;
+		}
+		try {
+			updatePricing((data) => {
+				const conf = data.providers[provider!]?.models[model!];
+				if (!conf) throw new Error(`未找到模型: ${provider}/${model}`);
+				const before = conf.plans.length;
+				conf.plans = conf.plans.filter((b) => b.plan !== plan!);
+				if (conf.plans.length === before) throw new Error(`该模型未绑定方案: ${plan}`);
+				return data;
+			}, this.filePath);
+		} catch (err) {
+			ctx.ui.notify(`解除失败: ${(err as Error).message}`, "info");
+			return;
+		}
+		ctx.ui.notify(`已解除 ${provider}/${model} → ${plan}`, "info");
 	}
 }

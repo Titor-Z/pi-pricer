@@ -115,7 +115,7 @@ export function renderModelDetail(provider: string, model: string, filePath?: st
 	lines.push(`  绑定方案（${conf.plans.length} · 启用 ${conf.plans.filter((b) => b.enabled).length}）:`);
 	lines.push(...modelCardLines(provider, model, filePath));
 	lines.push("");
-	lines.push("  编辑: 无参 /price 在抽屉内启停/排序/增删绑定，价格在清单面编辑（M2/M3）");
+	lines.push("  编辑: 无参 /price 在抽屉内启停/增删绑定（Ctrl+S 保存）；排序用 /price move");
 	return lines.join("\n");
 }
 
@@ -181,7 +181,7 @@ export function renderPlanDetail(planId: string, filePath?: string): string {
 		}
 	}
 	lines.push("");
-	lines.push("  编辑: /price plan set <id> <field> <value>（M3 UI 完善）");
+	lines.push("  编辑: 无参 /price 在抽屉内改规则/价格（Ctrl+S 保存）");
 	return lines.join("\n");
 }
 
@@ -249,12 +249,23 @@ export function renderHelp(): string {
 		"  /price                    无参开抽屉（模型面；TUI）",
 		"  /price list               模型计费总览（厂商 → 模型价目卡片）",
 		"  /price model <p> <m>      模型详情（绑定方案 + 实时生效）",
-		"  /price plan [<id>]        计费方案列表 / 详情",
+		"  /price plan [<id>]        方案列表 / 详情",
+		"  /price plan create <id> [name]     新建方案（默认挂首个价格）",
+		"  /price plan duplicate <id>         复制方案",
+		"  /price plan delete <id>            删除方案（被绑定时拒绝）",
 		"  /price price              价格实体注册表",
+		"  /price price create <id> [name]    新建价格实体",
+		"  /price price set <id> <field> <v>  修改价格（field: input.miss|input.hit|output）",
+		"  /price price delete <id>           删除价格（被引用时拒绝）",
 		"  /price calendar           日历（节假日）资源",
+		"  /price calendar add <id> <name> <dates...>   新建日历",
+		"  /price calendar remove <id>        删除日历（被引用时拒绝）",
 		"  /price resolve <m> [p] [ts]  调试命中链（如 2026-09-16T10:00）",
 		"  /price bind <p> <m> <plan>    为模型追加方案绑定（启用）",
 		"  /price unbind <p> <m> <plan>  移除模型绑定",
+		"  /price move <p> <m> <plan> <up|down|top|bottom>  调整绑定优先级",
 		"  /price schema             v2 结构说明",
+		"",
+		"注: 绑定重排序只走 CLI（TUI 抽屉不提供上下移）。",
 	].join("\n");
 }

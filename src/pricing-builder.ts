@@ -83,6 +83,18 @@ export function listProviderRows(filePath?: string): ProviderRow[] {
 	return rows;
 }
 
+/** 方案选项（绑定选择器用：可选方案的 id + 显示名） */
+export interface PlanOption {
+	id: string;
+	name: string;
+}
+
+/** 列出所有计费方案（绑定选择器候选） */
+export function listProviderPlans(filePath?: string): PlanOption[] {
+	const schema = readPricing(filePath);
+	return Object.entries(schema.plans).map(([id, plan]) => ({ id, name: plan.name }));
+}
+
 /** 列出抽屉第 1 级（指定厂商下）所需的所有模型行 */
 export function listModelRows(provider: string, filePath?: string): ModelRow[] {
 	const infos = listProviderModels(provider, undefined, filePath);

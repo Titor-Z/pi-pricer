@@ -7,7 +7,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createJiti } from "/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/jiti/lib/jiti.mjs";
@@ -569,7 +569,7 @@ test("抽屉：Enter 下钻 → 模型行 → 详情页 → Esc 返回闭环", a
 	handle.handleInput("\r");
 	const level1 = plainOf(handle);
 	assert.ok(level1.includes("deepseek-flash"), "应显示模型列表");
-	assert.ok(level1.includes("当前 ¥"), "模型行显示实时价");
+	assert.ok(level1.includes("档启用"), "模型行显示绑定启用数");
 	assert.ok(level1.includes("模型计费配置 · deepseek"), "标题应更新为厂商层级");
 
 	handle.handleInput("\x1b");
@@ -578,13 +578,18 @@ test("抽屉：Enter 下钻 → 模型行 → 详情页 → Esc 返回闭环", a
 	handle.handleInput("\r");
 	handle.handleInput("\r");
 	const detail = plainOf(handle);
-	assert.ok(detail.includes("deepseek/deepseek-flash"));
-	assert.ok(detail.includes("别名: deepseek-v4-flash"));
-	assert.ok(detail.includes("当前生效"));
+	assert.ok(detail.includes("deepseek-flash"), "详情页列出模型绑定");
+	assert.ok(detail.includes("绑定新方案"), "提供追加绑定入口");
+
+	// 进入只读详情页（Enter 到最后一项）
+	handle.handleInput("\x1b[F");
+	handle.handleInput("\r");
+	const readonlyPage = plainOf(handle);
+	assert.ok(readonlyPage.includes("deepseek/deepseek-flash"), "只读详情页含模型路径");
 
 	handle.handleInput("\x1b");
 	const back1 = plainOf(handle);
-	assert.ok(back1.includes("deepseek-flash"), "Esc 返回模型列表");
+	assert.ok(back1.includes("deepseek-flash"), "Esc 返回模型详情菜单");
 	rmSync(tmpDir(), { recursive: true, force: true });
 });
 
@@ -693,5 +698,357 @@ test("挂载：/price resolve 输出命中链；/price plan 输出清单列表",
 	ctx.notifications.length = 0;
 	await handler("bogus", ctx);
 	assert.ok(ctx.notifications.at(-1).includes("/price resolve"), "未知子命令给 help");
+	rmSync(dir, { recursive: true, force: true });
+});
+// ── v0.5 编辑面（PricingDraft）───────────────────────────────────────────
+
+const { PricingDraft } = await jiti.import(`${SRC}/pricing-draft.ts`);
+const { listProviderPlans } = await jiti.import(`${SRC}/pricing-builder.ts`);
+
+test("draft：变更写入内存，未 save 时磁盘不变", () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+
+	const draft = new PricingDraft(path);
+	assert.equal(draft.isDirty, false, "初始无改动");
+
+	draft.toggleBinding("deepseek", "deepseek-flash", "peakworkday");
+	assert.equal(draft.isDirty, true, "切换后应标记为脏");
+	assert.deepEqual(draft.changedAreas, ["模型"]);
+
+	// 未 save：磁盘仍是原值（峰时仍是峰价 8）
+	assert.equal(resolvePricing("deepseek-flash", "deepseek", PEAK_TS, path).output, 8, "未保存时磁盘不变");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("draft：save 全量落盘后 resolve 反映改动", () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+
+	const draft = new PricingDraft(path);
+	draft.toggleBinding("deepseek", "deepseek-flash", "peakworkday");
+	const result = draft.save();
+
+	assert.equal(result.ok, true);
+	assert.equal(draft.isDirty, false, "保存后脏标记应清空");
+	// 禁用峰方案后，峰时回落到谷价 4
+	assert.equal(resolvePricing("deepseek-flash", "deepseek", PEAK_TS, path).output, 4, "禁用峰后峰时走谷价");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("draft：reset 丢弃未保存改动", () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+
+	const draft = new PricingDraft(path);
+	draft.setPriceField("peak", "output", 99);
+	assert.equal(draft.isDirty, true);
+	draft.reset();
+	assert.equal(draft.isDirty, false, "reset 后不应有改动");
+	assert.equal(draft.snapshot().prices.peak.output, 8, "内存态恢复原值");
+	assert.equal(resolvePricing("deepseek-flash", "deepseek", PEAK_TS, path).output, 8, "磁盘未被污染");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("draft：删除被绑定方案时 save 被拒且不落盘", () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+
+	const draft = new PricingDraft(path);
+	draft.deletePlan("peakworkday");
+	const result = draft.save();
+
+	assert.equal(result.ok, false, "仍被绑定的方案应拒绝保存");
+	assert.ok(result.reason.includes("peakworkday"), "拒绝原因应指明方案");
+	// 磁盘仍是原状（峰价 8 生效）
+	assert.equal(resolvePricing("deepseek-flash", "deepseek", PEAK_TS, path).output, 8, "拒绝时不得落盘");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("draft：绑定增删与别名设置", () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+
+	const draft = new PricingDraft(path);
+	assert.equal(draft.removeBinding("deepseek", "deepseek-flash", "valleyalways"), true);
+	assert.equal(draft.snapshot().providers.deepseek.models["deepseek-flash"].plans.length, 1);
+
+	assert.equal(draft.addBinding("deepseek", "deepseek-flash", "valleyalways"), true);
+	const plans = draft.snapshot().providers.deepseek.models["deepseek-flash"].plans;
+	assert.equal(plans.at(-1).plan, "valleyalways", "追加应落在末尾（最低优先级）");
+
+	assert.equal(draft.setAlias("deepseek", "deepseek-flash", "ds-flash"), true);
+	assert.equal(draft.snapshot().providers.deepseek.models["deepseek-flash"].alias, "ds-flash");
+	draft.setAlias("deepseek", "deepseek-flash", "");
+	assert.equal(draft.snapshot().providers.deepseek.models["deepseek-flash"].alias, undefined, "空串应清除别名");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("draft：方案复制与至少保留一条规则", () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+
+	const draft = new PricingDraft(path);
+	const newId = draft.duplicatePlan("valleyalways");
+	assert.equal(newId, "valleyalways-copy");
+	assert.ok(draft.snapshot().plans[newId].name.includes("副本"));
+
+	// 单规则方案不允许删除最后一条
+	assert.equal(draft.removeRule("valleyalways-copy", 0), false, "至少保留一条规则");
+	assert.equal(draft.addRule("valleyalways-copy"), true);
+	assert.equal(draft.snapshot().plans["valleyalways-copy"].rules.length, 2);
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("draft：listProviderPlans 列出全部方案", () => {
+	const dir = tmpDir();
+	const path = writeFixture(dir);
+	const plans = listProviderPlans(path);
+	assert.equal(plans.length, 3);
+	assert.ok(plans.some((p) => p.id === "peakworkday" && p.name === "工作日高峰"));
+	rmSync(dir, { recursive: true, force: true });
+});
+
+// ── v0.5 CLI：/price move 绑定优先级 ─────────────────────────────────────
+
+test("挂载：/price move 上移绑定 → 优先级改变（first match wins）", async () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+	const { handler } = mountAt(path);
+	const ctx = cmdCtx({ withCustom: false });
+	ctx.ui = { notify: ctx.ui.notify };
+
+	// 默认：peakworkday 在前 → 峰时 8
+	assert.equal(resolvePricing("deepseek-flash", "deepseek", PEAK_TS, path).output, 8);
+
+	// 把 valleyalways 移到最前
+	await handler("move deepseek deepseek-flash valleyalways top", ctx);
+	assert.ok(ctx.notifications.at(-1).includes("已移动"));
+
+	const order = JSON.parse(readFileSync(path, "utf8"))
+		.providers.deepseek.models["deepseek-flash"].plans.map((b) => b.plan);
+	assert.deepEqual(order, ["valleyalways", "peakworkday"], "谷价方案应排到最前");
+	assert.equal(resolvePricing("deepseek-flash", "deepseek", PEAK_TS, path).output, 4, "谷价优先后峰时也给谷价");
+
+	// 再 down 移回
+	await handler("move deepseek deepseek-flash valleyalways down", ctx);
+	assert.equal(resolvePricing("deepseek-flash", "deepseek", PEAK_TS, path).output, 8, "下移后峰价恢复");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("挂载：/price move 越界不破坏数据；无效方向被拒", async () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+	const { handler } = mountAt(path);
+	const ctx = cmdCtx({ withCustom: false });
+	ctx.ui = { notify: ctx.ui.notify };
+
+	// up 已在最前：空操作 + 提示
+	await handler("move deepseek deepseek-flash peakworkday up", ctx);
+	assert.ok(ctx.notifications.at(-1).includes("最高优先级"), "应提示已在最高优先级");
+
+	ctx.notifications.length = 0;
+	await handler("move deepseek deepseek-flash peakworkday sideways", ctx);
+	assert.ok(ctx.notifications.at(-1).includes("无效方向"), "无效方向应被拒");
+
+	ctx.notifications.length = 0;
+	await handler("move deepseek deepseek-flash nonexistent up", ctx);
+	assert.ok(ctx.notifications.at(-1).includes("未绑定"), "未绑定方案应报错");
+
+	// 数据未被破坏
+	const order = JSON.parse(readFileSync(path, "utf8"))
+		.providers.deepseek.models["deepseek-flash"].plans.map((b) => b.plan);
+	assert.deepEqual(order, ["peakworkday", "valleyalways"]);
+	rmSync(dir, { recursive: true, force: true });
+});
+
+// ── v0.5 CLI：管理面 CRUD ────────────────────────────────────────────────
+
+test("挂载：/price plan create|duplicate|delete", async () => {
+	const dir = tmpDir();
+	const path = writeFixture(dir);
+	const { handler } = mountAt(path);
+	const ctx = cmdCtx({ withCustom: false });
+	ctx.ui = { notify: ctx.ui.notify };
+
+	await handler("plan create myplan 我的方案", ctx);
+	assert.ok(ctx.notifications.at(-1).includes("已新建方案 myplan"));
+	assert.ok(readPricing(path).plans.myplan, "方案应写入");
+	assert.equal(readPricing(path).plans.myplan.rules.length, 1, "默认挂一条规则");
+
+	ctx.notifications.length = 0;
+	await handler("plan duplicate myplan", ctx);
+	assert.ok(ctx.notifications.at(-1).includes("myplan-copy"));
+	assert.ok(readPricing(path).plans["myplan-copy"]);
+
+	ctx.notifications.length = 0;
+	await handler("plan delete myplan-copy", ctx);
+	assert.ok(ctx.notifications.at(-1).includes("已删除方案"));
+	assert.equal(readPricing(path).plans["myplan-copy"], undefined);
+
+	// 被绑定的方案拒绝删除
+	ctx.notifications.length = 0;
+	await handler("plan delete peakworkday", ctx);
+	assert.ok(ctx.notifications.at(-1).includes("仍被"), "被绑定方案应拒绝删除");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("挂载：/price calendar add|remove 与被引用保护", async () => {
+	const dir = tmpDir();
+	const path = writeFixture(dir);
+	const { handler } = mountAt(path);
+	const ctx = cmdCtx({ withCustom: false });
+	ctx.ui = { notify: ctx.ui.notify };
+
+	await handler("calendar add promo 促销日 03-15 06-18", ctx);
+	assert.ok(ctx.notifications.at(-1).includes("已写入日历 promo"));
+	assert.deepEqual(readPricing(path).calendars.promo.dates, ["03-15", "06-18"]);
+
+	ctx.notifications.length = 0;
+	await handler("calendar add bad 坏日期 2026-13", ctx);
+	assert.ok(ctx.notifications.at(-1).includes("无效日期"), "坏日期应被拒");
+
+	// 引用了日历的方案 → 删除该引用方案前，日历不可删
+	ctx.notifications.length = 0;
+	await handler("plan delete peakworkday", ctx);  // 先解除对日历的潜在引用（此处无引用，故成功）
+	await handler("plan create calplan 日历方案", ctx);
+	updatePricing((data) => {
+		data.plans.calplan.rules[0].schedule.calendar = "promo";
+		return data;
+	}, path);
+	ctx.notifications.length = 0;
+	await handler("calendar remove promo", ctx);
+	assert.ok(ctx.notifications.at(-1).includes("仍被方案"), "被引用日历应拒绝删除");
+
+	// 解除引用后可删
+	updatePricing((data) => {
+		delete data.plans.calplan.rules[0].schedule.calendar;
+		return data;
+	}, path);
+	ctx.notifications.length = 0;
+	await handler("calendar remove promo", ctx);
+	assert.ok(ctx.notifications.at(-1).includes("已删除日历 promo"));
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("挂载：/price price create", async () => {
+	const dir = tmpDir();
+	const path = writeFixture(dir);
+	const { handler } = mountAt(path);
+	const ctx = cmdCtx({ withCustom: false });
+	ctx.ui = { notify: ctx.ui.notify };
+
+	await handler("price create myprice 我的价格", ctx);
+	assert.ok(ctx.notifications.at(-1).includes("已新建价格 myprice"));
+	assert.equal(readPricing(path).prices.myprice.output, 0, "初始价为 0");
+
+	ctx.notifications.length = 0;
+	await handler("price create myprice", ctx);
+	assert.ok(ctx.notifications.at(-1).includes("已存在"), "重复创建应被拒");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+// ── v0.5 抽屉编辑闭环 ───────────────────────────────────────────────────
+
+test("抽屉：详情页可编辑（绑定操作子菜单）", async () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+	const ctx = drawerCtx();
+	await new PricingDrawer(path).open(ctx);
+	const handle = runDrawer(ctx.captured);
+
+	handle.handleInput("\r");        // 进入 deepseek
+	handle.handleInput("\r");        // 进入 deepseek-flash 详情
+	const detail = plainOf(handle);
+	assert.ok(detail.includes("工作日高峰"), "详情页列出绑定方案");
+	assert.ok(detail.includes("绑定新方案"), "提供增绑入口");
+	assert.ok(detail.includes("别名"), "提供别名编辑入口");
+	assert.ok(detail.includes("解析调试"), "提供解析调试入口");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("抽屉：Ctrl+S 保存绑定改动到磁盘", async () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+	const ctx = drawerCtx();
+	await new PricingDrawer(path).open(ctx);
+	const handle = runDrawer(ctx.captured);
+
+	handle.handleInput("\r");        // deepseek
+	handle.handleInput("\r");        // deepseek-flash
+	handle.handleInput("\r");        // 第一条绑定（peakworkday）
+	const actions = plainOf(handle);
+	assert.ok(actions.includes("禁用该绑定"), "绑定操作页应提供禁用");
+
+	handle.handleInput("\r");        // 执行禁用（子菜单关闭，回到详情页）
+	handle.handleInput("\x1b");      // 详情 -> 模型列表
+	handle.handleInput("\x1b");      // 模型列表 -> 厂商列表（根层）
+	const afterToggle = plainOf(handle);
+	assert.ok(afterToggle.includes("未保存改动"), "应显示未保存状态");
+
+	handle.handleInput("\u0013");    // Ctrl+S
+	assert.ok(plainOf(handle).includes("已保存"), "保存后状态应变为已保存");
+
+	// 磁盘生效：峰方案被禁用 → 峰时走谷价
+	assert.equal(resolvePricing("deepseek-flash", "deepseek", PEAK_TS, path).output, 4, "Ctrl+S 后改动应落盘");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("抽屉：Ctrl+R 丢弃未保存改动", async () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+	const ctx = drawerCtx();
+	await new PricingDrawer(path).open(ctx);
+	const handle = runDrawer(ctx.captured);
+
+	handle.handleInput("\r");
+	handle.handleInput("\r");
+	handle.handleInput("\r");
+	handle.handleInput("\r");        // 禁用第一条绑定
+	handle.handleInput("\x1b");      // 回根层
+	handle.handleInput("\x1b");
+	assert.ok(plainOf(handle).includes("未保存改动"));
+
+	handle.handleInput("\u0012");    // Ctrl+R
+	const after = plainOf(handle);
+	assert.ok(after.includes("已保存"), "重置后应显示已保存");
+	assert.ok(after.includes("已丢弃"), "应提示已丢弃改动");
+
+	assert.equal(resolvePricing("deepseek-flash", "deepseek", PEAK_TS, path).output, 8, "磁盘不应被改动");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("抽屉：管理面入口（方案/价格/日历）可下钻", async () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+	const ctx = drawerCtx();
+	await new PricingDrawer(path).open(ctx);
+	const handle = runDrawer(ctx.captured);
+
+	const root = plainOf(handle);
+	assert.ok(root.includes("方案注册表"), "根层应含方案注册表入口");
+	assert.ok(root.includes("价格注册表"), "根层应含价格注册表入口");
+	assert.ok(root.includes("日历注册表"), "根层应含日历注册表入口");
+
+	// 下钻到方案注册表：根列表 = 2 厂商(deepseek, glm) + 方案/价格/日历 = 5 项
+	// 从 deepseek 起 down 2 次到达「方案注册表」
+	handle.handleInput("\u001b[B");  // down -> glm
+	handle.handleInput("\u001b[B");  // down -> 方案注册表
+	handle.handleInput("\r");
+	const plansPage = plainOf(handle);
+	assert.ok(plansPage.includes("工作日高峰"), "方案注册表应列出方案名");
+	assert.ok(plansPage.includes("模型计费配置 · 方案"), "标题应更新为方案层级");
 	rmSync(dir, { recursive: true, force: true });
 });

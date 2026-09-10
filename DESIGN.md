@@ -70,11 +70,13 @@ Pi 生态的模型计费数据共享中心。解决"厂商调价频繁，硬编�
 
 ### Model Detail（Level 2，可编辑菜单）
 - SettingsList 菜单页，逐项带 `submenu`：
-  - 每条绑定一行：`◉/◌ <方案名>`，说明栏列出该方案规则时段
+  - 每条绑定一行：`#N ◉/◌ <方案名>`（`#N` = 优先级序号，首个标 `← 先匹配`），
+    说明栏列出该方案规则时段 + "排序用 /price move"
   - `＋ 绑定新方案`（仅在存在未绑定方案时显示）
   - `别名（台账匹配）` → ExtensionInputComponent 覆盖层输入
-  - `解析调试（当前命中链）` → 只读文本页（resolveDebug）
-  - `查看只读详情` → 只读文本页（renderModelDetail）
+  - `解析调试（预演某时刻命中链）` → ActionMenu（`此刻` / `指定时间…`）
+    → 只读命中链页（`renderResolveResult`）
+  - `查看只读详情` → 只读文本页（`renderModelDetail`）
 
 ### Binding Actions（Level 3）
 - **ActionMenu 自绘菜单**（不用 SettingsList，原因见下）：
@@ -83,17 +85,24 @@ Pi 生态的模型计费数据共享中心。解决"厂商调价频繁，硬编�
 - 执行后回写 draft，回退至 Model Detail，状态栏提示"（Ctrl+S 保存）"
 
 ### Registry Pages（管理面）
-- **方案注册表**：每方案 → 规则列表（每条规则可改价格引用 / 有效期）
+- **方案注册表**：首项为人 `＋ 新建方案`（输入 id，默认挂首个价格实体的
+  always 规则）；每方案 → 规则列表（改价格引用 / 有效期）
   + `方案操作（追加规则 / 复制 / 删除）`
-- **价格注册表**：每个价格实体 → 改 output / input.miss / input.hit / 删除
-- **日历注册表**：每个日历 → 删除
+- **价格注册表**：首项 `＋ 新建价格实体`（初值 0）；
+  每个价格实体 → 改 output / input.miss / input.hit / 删除
+- **日历注册表**：首项 `＋ 新建日历`（两步输入：id → 逗号分隔日期）；
+  每个日历 → 删除
 - 删除均经 `validate()` 引用保护；保存失败只提示，不退出
 
 ### ActionMenu（为何不用 SettingsList）
 `SettingsList` 的 `activateItem()` 仅对 `submenu` 项和 `values` 项生效；
 **无 submenu / 无 values 的普通项按 Enter 是空操作**。因此"执行动作"类页面
-（绑定启停、方案操作、价格字段、删除确认）改用 `ActionMenu` 自绘菜单
+（绑定启停、方案操作、价格字段、删除确认、新建输入）改用 `ActionMenu` 自绘菜单
 （↑↓ 选择 / Enter 执行 / Esc 返回），行为可预期。
+
+### 临时页栈（pageStack）
+ActionMenu 之上需要再叠一层只读页（如解析命中链）时，顶层 `handleInput`
+优先派发给栈顶；栈顶页的 Esc 触发 `popPage()` 出栈而非逐级返回。
 
 ## Interaction
 
@@ -122,7 +131,7 @@ Pi 生态的模型计费数据共享中心。解决"厂商调价频繁，硬编�
 |---|---|
 | ↑/↓ | 移动光标 |
 | Enter | 下钻 / 执行动作 |
-| Esc | 返回上级（根层退出；有未保存改动时先提示） |
+| Esc | 返回上级；根层：第一次提示、**第二次丢弃并退出** |
 | 键入 | 搜索过滤（带 `enableSearch` 的列表） |
 | **Ctrl+S** | **全量保存草稿到 `~/.pi/model-pricing.json`** |
 | **Ctrl+R** | **丢弃未保存改动（重读磁盘）** |
@@ -153,7 +162,13 @@ Ctrl+R → reset() 重新 readPricing，清空 changed
 
 绑定数组顺序即优先级，但 **TUI 抽屉不提供上下移**：`SettingsList` 不暴露
 `selectedIndex` 且子菜单会接管输入，自建可重排列表成本高。排序由 CLI
-`/price move` 承担，抽屉内绑定顺序只读展示。
+`/price move` 承担，抽屉内绑定顺序以 `#N` 序号**只读展示**并在说明栏提示命令。
+
+### 预演调试（为何需要 pageStack）
+
+解析调试页要预演"某个未来时刻命中了哪档价"，其命中链只读页需要叠在
+ActionMenu 之上而不丢失菜单上下文；因此引入 `pageStack`：顶层输入优先派发给
+栈顶，栈顶 Esc 出栈回到 ActionMenu。
 
 ### 无 TUI 回退
 
@@ -219,6 +234,16 @@ v1 每个模型一份价格、厂商共享峰时段；v2 拆成**五注册表原
 - **calendars**：节假日/特殊日期表（`dates` 支持 "YYYY-MM-DD" 精确日期 +
   "MM-DD" 每年循环），方案 schedule 通过 `calendar` + `calendarMode`（include/exclude）
   引用
+
+#### CalendarEntry 字段
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `name` | `string` | ✓ | 日历显示名（如 "中国法定节假日"） |
+| `dates` | `string[]` | ✓ | 日期列表；每项为 `"YYYY-MM-DD"`（单年）或 `"MM-DD"`（每年循环） |
+
+> 日历不含时段字段：时段约束属于 `Schedule.ranges`，日历只回答"这一天是否特殊"。
+> 两者通过 `rules[].schedule.calendar` + `calendarMode` 组合。
 - **prices**：价格实体（`input.miss/hit` + `output`），可被多个方案规则复用
 - **plans**：命名方案（时段规则集合），`rules[].schedule` 定义生效时间窗，
   `rules[].price` 指向价格实体；规则支持 includeDates / excludeDates /
@@ -248,7 +273,7 @@ resolvePricing(model, provider, ts)
 
 ```jsonc
 { "version": 2,
-  "calendars": { "holidays": { "name": "节假日", "dates": ["2026-10-01", "01-01"], "ranges": null } },
+  "calendars": { "holidays": { "name": "节假日", "dates": ["2026-10-01", "01-01"] } },
   "prices":   { "deepseek-peak":  { "name": "DeepSeek 峰价", "input": {"miss":2,"hit":0.04}, "output": 8 } },
   "plans":    { "deepseek-peak-workday": { "name": "工作日高峰",
                 "rules": [ { "schedule": { "timezone": "Asia/Shanghai", "weekdays": [1,2,3,4,5],
@@ -307,7 +332,10 @@ resolvePricing(model, provider, ts)
 - Do 保持 `resolvePricing()` 的 fallback 链：JSON → 硬编码兜底
 - Do 三级钻取的交互层级与 pi-prompt /prompt config 保持一致
 - Do 所有抽屉编辑先写 `PricingDraft`，Ctrl+S 才落盘
-- Do 删除类操作一律经引用保护（checkPlanDeletable / checkPriceDeletable / validate）
+- Do 删除类操作一律经引用保护（`validate()` 的 checkBindings / checkPlans）
+- Do 用显式深度计数器（`depth`）判断当前层级，**不要用标题等展示层状态反推**
+- Do "首次提示、再次确认"的守卫（如 Esc 退出）必须带已提示状态位
+- Do 每个 submenu 的关闭路径统一走一个 `finish()`，避免双重关闭
 - Do 让 `/price list` 在 headless 模式下回退为文本输出，且每个编辑能力都有 CLI 等价命令
 - Don't 用 SettingsList 做"执行动作"（普通项 Enter 是空操作）——用 `submenu` 或 ActionMenu
 - Don't 在抽屉子菜单内期待顶层快捷键生效（子菜单会接管输入）

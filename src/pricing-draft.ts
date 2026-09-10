@@ -8,7 +8,7 @@
  * - 纯逻辑无 TUI 依赖，可直接单测
  */
 
-import { readPricing, writePricing, checkPlanDeletable, checkPriceDeletable } from "./pricing-store.ts";
+import { readPricing, writePricing } from "./pricing-store.ts";
 import type {
 	CalendarEntry,
 	PricingPlan,
@@ -241,36 +241,52 @@ export class PricingDraft {
 	 * 保存前引用完整性校验：绑定/规则的引用目标必须存在于注册表。
 	 * 注意："方案被绑定"本身是合法状态，不在此拒绝；
 	 * 只有引用目标缺失（脏引用）或方案无规则才拒绝落盘。
+	 * 返回 "" 表示通过，否则返回拒绝原因。
 	 */
 	private validate(): SaveResult {
+		const bindingIssue = this.checkBindings();
+		if (bindingIssue) return { ok: false, reason: bindingIssue };
+		const planIssue = this.checkPlans();
+		if (planIssue) return { ok: false, reason: planIssue };
+		return { ok: true, reason: "" };
+	}
+
+	/** 校验所有模型绑定都指向存在的方案 */
+	private checkBindings(): string {
 		for (const [provId, prov] of Object.entries(this.data.providers)) {
 			for (const [modelId, conf] of Object.entries(prov.models)) {
 				for (const b of conf.plans) {
 					if (!this.data.plans[b.plan]) {
-						return { ok: false, reason: `模型 ${provId}/${modelId} 绑定了不存在的方案 "${b.plan}"` };
+						return `模型 ${provId}/${modelId} 绑定了不存在的方案 "${b.plan}"`;
 					}
 				}
 			}
 		}
+		return "";
+	}
+
+	/** 校验每个方案的规则：至少一条、价格引用存在、日历引用存在 */
+	private checkPlans(): string {
 		for (const [planId, plan] of Object.entries(this.data.plans)) {
-			for (const rule of plan.rules) {
-				if (!this.data.prices[rule.price]) {
-					return { ok: false, reason: `方案 "${planId}" 的规则引用了不存在的价格 "${rule.price}"` };
-				}
+			if (plan.rules.length === 0) return `方案 "${planId}" 没有规则`;
+			const issue = this.checkRulesOf(planId, plan.rules);
+			if (issue) return issue;
+		}
+		return "";
+	}
+
+	/** 校验单个方案的规则引用（价格 / 日历） */
+	private checkRulesOf(planId: string, rules: PricingRule[]): string {
+		for (const rule of rules) {
+			if (!this.data.prices[rule.price]) {
+				return `方案 "${planId}" 的规则引用了不存在的价格 "${rule.price}"`;
 			}
-			if (plan.rules.length === 0) {
-				return { ok: false, reason: `方案 "${planId}" 没有规则` };
+			const calId = rule.schedule.calendar;
+			if (calId && !this.data.calendars[calId]) {
+				return `方案 "${planId}" 引用了不存在的日历 "${calId}"`;
 			}
 		}
-		for (const [planId, plan] of Object.entries(this.data.plans)) {
-			for (const rule of plan.rules) {
-				const calId = rule.schedule.calendar;
-				if (calId && !this.data.calendars[calId]) {
-					return { ok: false, reason: `方案 "${planId}" 引用了不存在的日历 "${calId}"` };
-				}
-			}
-		}
-		return { ok: true, reason: "" };
+		return "";
 	}
 
 	/** 全量落盘（用户选择"全量写回"语义）；校验失败则不写 */
@@ -289,12 +305,3 @@ export class PricingDraft {
 	}
 }
 
-/** 价格实体删除的引用保护（供 UI 预先提示，避免用户白操作） */
-export function canDeletePlan(schema: PricingSchema, planId: string): boolean {
-	return checkPlanDeletable(schema, planId).ok;
-}
-
-/** 价格实体删除的引用保护（供 UI 预先提示） */
-export function canDeletePrice(schema: PricingSchema, priceId: string): boolean {
-	return checkPriceDeletable(schema, priceId).ok;
-}

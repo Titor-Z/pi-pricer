@@ -1052,3 +1052,362 @@ test("抽屉：管理面入口（方案/价格/日历）可下钻", async () => 
 	assert.ok(plansPage.includes("模型计费配置 · 方案"), "标题应更新为方案层级");
 	rmSync(dir, { recursive: true, force: true });
 });
+
+// ── v0.6 缺陷修复与清理 ─────────────────────────────────────────────────
+
+test("v0.6 Esc：首次提示、再次丢弃退出（不再卡死）", async () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+	const ctx = drawerCtx();
+	await new PricingDrawer(path).open(ctx);
+	const handle = runDrawer(ctx.captured);
+
+	// 制造未保存改动并回到根层
+	handle.handleInput("\r"); handle.handleInput("\r"); handle.handleInput("\r"); handle.handleInput("\r");
+	handle.handleInput("\x1b"); handle.handleInput("\x1b");
+	assert.ok(plainOf(handle).includes("未保存改动"), "根层应显示未保存");
+
+	handle.handleInput("\x1b");
+	assert.equal(handle.doneCount(), 0, "首次 Esc 不应退出");
+	assert.ok(plainOf(handle).includes("再按 Esc 放弃退出"), "首次 Esc 应给提示");
+
+	handle.handleInput("\x1b");
+	assert.equal(handle.doneCount(), 1, "第二次 Esc 应退出");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.6 Ctrl+S 后 Esc 状态位重置（重新提示）", async () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+	const ctx = drawerCtx();
+	await new PricingDrawer(path).open(ctx);
+	const handle = runDrawer(ctx.captured);
+
+	handle.handleInput("\r"); handle.handleInput("\r"); handle.handleInput("\r"); handle.handleInput("\r");
+	handle.handleInput("\x1b"); handle.handleInput("\x1b");
+	handle.handleInput("\x1b");   // 首次提示
+	handle.handleInput("\u0013"); // Ctrl+S 保存
+	assert.equal(handle.doneCount(), 0, "保存不应退出");
+
+	// 保存后已无改动 → Esc 应直接退出（无需提示）
+	handle.handleInput("\x1b");
+	assert.equal(handle.doneCount(), 1, "无改动时 Esc 直接退出");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.6 深度计数：三层往返后 Esc 逐级返回不回退过头", async () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+	const ctx = drawerCtx();
+	await new PricingDrawer(path).open(ctx);
+	const handle = runDrawer(ctx.captured);
+
+	handle.handleInput("\r");                        // 厂商
+	assert.ok(plainOf(handle).includes("模型计费配置 · deepseek"));
+	handle.handleInput("\r");                        // 模型详情
+	handle.handleInput("\x1b");                      // 回模型列表
+	assert.ok(plainOf(handle).includes("deepseek-flash"), "应回到模型列表");
+	handle.handleInput("\x1b");                      // 回厂商列表
+	assert.ok(plainOf(handle).includes("模型计费配置 · 厂商"), "应回到根层");
+	assert.equal(handle.doneCount(), 0, "不应退出");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.6 绑定优先级：详情页显示 #N 序号与先匹配标注", async () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+	const ctx = drawerCtx();
+	await new PricingDrawer(path).open(ctx);
+	const handle = runDrawer(ctx.captured);
+
+	handle.handleInput("\r"); handle.handleInput("\r");
+	const detail = plainOf(handle);
+	assert.ok(detail.includes("#1"), "应显示优先级 #1");
+	assert.ok(detail.includes("#2"), "应显示优先级 #2");
+	assert.ok(detail.includes("先匹配"), "首个绑定应标注先匹配");
+	assert.ok(detail.includes("排序用 /price move"), "应提示排序命令");
+	// 顺序应与 plans 数组一致
+	const i1 = detail.indexOf("#1");
+	const i2 = detail.indexOf("#2");
+	assert.ok(i1 < i2, "#1 应排在 #2 之前");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.6 抽屉内新建方案：overlay 输入 → 内存生效 → Ctrl+S 落盘", async () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+	const ctx = drawerCtx();
+	await new PricingDrawer(path).open(ctx);
+
+	// 捕获 showOverlay 弹入的输入组件，用于模拟用户输入
+	let overlay = null;
+	const tui = { showOverlay: (comp) => { overlay = comp; return { hide() {} }; } };
+	let doneCount = 0;
+	const handle = ctx.captured.factory(tui, { fg: (c, t) => t, bold: (t) => t }, {}, () => { doneCount += 1; });
+	const plain = () => handle.render(100).join("\n").replace(/\u001b\[\d+(;\d+)*m/g, "");
+
+	// 根层索引 2 = 方案注册表
+	handle.handleInput("\u001b[B"); handle.handleInput("\u001b[B");
+	handle.handleInput("\r");
+	assert.ok(plain().includes("＋ 新建方案"), "方案注册表应有新建入口");
+
+	handle.handleInput("\r");   // 打开新建（首项）
+	assert.ok(overlay !== null, "应弹出输入层");
+	// 模拟输入 id 并提交
+	overlay.handleInput("brand-new-plan");
+	overlay.handleInput("\r");
+
+	// 内存已生效（新方案出现在注册表）
+	assert.ok(plain().includes("brand-new-plan"), "注册表应显示新方案");
+
+	handle.handleInput("\u0013");  // Ctrl+S
+	assert.equal(doneCount, 0, "保存不应退出抽屉");
+	const saved = readPricing(path);
+	assert.ok(saved.plans["brand-new-plan"], "新方案应已落盘");
+	assert.equal(saved.plans["brand-new-plan"].rules.length, 1, "新方案应含一条默认规则");
+	assert.ok(saved.plans["brand-new-plan"].rules[0].price, "默认规则应挂价格实体");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.6 抽屉内新建方案：id 重复被拒且不写入", async () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+	const ctx = drawerCtx();
+	await new PricingDrawer(path).open(ctx);
+
+	let overlay = null;
+	const tui = { showOverlay: (comp) => { overlay = comp; return { hide() {} }; } };
+	const handle = ctx.captured.factory(tui, { fg: (c, t) => t, bold: (t) => t }, {}, () => {});
+	const plain = () => handle.render(100).join("\n").replace(/\u001b\[\d+(;\d+)*m/g, "");
+
+	handle.handleInput("\u001b[B"); handle.handleInput("\u001b[B"); handle.handleInput("\r");
+	handle.handleInput("\r");
+	overlay.handleInput("valleyalways");   // 已存在的方案 id
+	overlay.handleInput("\r");
+
+	assert.ok(plain().includes("已存在"), "重复 id 应提示已存在");
+	// 原有方案规则数不变
+	assert.equal(readPricing(path).plans.valleyalways.rules.length, 1, "不应破坏已有方案");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.6 抽屉内新建价格实体：overlay 输入 → 落盘", async () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+	const ctx = drawerCtx();
+	await new PricingDrawer(path).open(ctx);
+
+	let overlay = null;
+	const tui = { showOverlay: (comp) => { overlay = comp; return { hide() {} }; } };
+	const handle = ctx.captured.factory(tui, { fg: (c, t) => t, bold: (t) => t }, {}, () => {});
+
+	// 价格注册表（索引 3）
+	handle.handleInput("\u001b[B"); handle.handleInput("\u001b[B"); handle.handleInput("\u001b[B");
+	handle.handleInput("\r");
+	handle.handleInput("\r");   // 新建价格（首项）
+	assert.ok(overlay !== null, "应弹出输入层");
+	overlay.handleInput("vendor-new");
+	overlay.handleInput("\r");
+	handle.handleInput("\u0013");  // Ctrl+S
+
+	const saved = readPricing(path);
+	assert.ok(saved.prices["vendor-new"], "新价格实体应落盘");
+	assert.equal(saved.prices["vendor-new"].output, 0, "初值应为 0");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.6 抽屉内新建日历：两步输入 + 非法日期被拒", async () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+	const ctx = drawerCtx();
+	await new PricingDrawer(path).open(ctx);
+
+	let overlay = null;
+	const tui = { showOverlay: (comp) => { overlay = comp; return { hide() {} }; } };
+	const handle = ctx.captured.factory(tui, { fg: (c, t) => t, bold: (t) => t }, {}, () => {});
+	const plain = () => handle.render(100).join("\n").replace(/\u001b\[\d+(;\d+)*m/g, "");
+
+	// 日历注册表（索引 4）
+	handle.handleInput("\u001b[B"); handle.handleInput("\u001b[B"); handle.handleInput("\u001b[B"); handle.handleInput("\u001b[B");
+	handle.handleInput("\r");
+	handle.handleInput("\r");   // 新建日历（首项）
+	overlay.handleInput("promo-2026");
+	overlay.handleInput("\r");
+	// 第二步：日期（合法）
+	overlay.handleInput("03-15, 2026-06-18");
+	overlay.handleInput("\r");
+	handle.handleInput("\u0013");
+
+	const saved = readPricing(path);
+	assert.ok(saved.calendars["promo-2026"], "新日历应落盘");
+	assert.deepEqual(saved.calendars["promo-2026"].dates, ["03-15", "2026-06-18"], "日期应被正确切分");
+
+	// 非法日期路径
+	handle.handleInput("\r");
+	overlay.handleInput("bad-cal");
+	overlay.handleInput("\r");
+	overlay.handleInput("2026-13-99");
+	overlay.handleInput("\r");
+	assert.ok(plain().includes("无效日期"), "非法日期应被拒");
+	assert.equal(readPricing(path).calendars["bad-cal"], undefined, "非法日期不应写入");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.6 解析调试页：此刻 / 指定时间入口", async () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+	const ctx = drawerCtx();
+	await new PricingDrawer(path).open(ctx);
+	const handle = runDrawer(ctx.captured);
+
+	handle.handleInput("\r"); handle.handleInput("\r");
+	// 详情页定位到解析调试卷（绑定2 + 增绑 + 别名 + 解析调试 = 第 5 项，索引 4）
+	for (let i = 0; i < 4; i++) handle.handleInput("\u001b[B");
+	assert.ok(plainOf(handle).includes("解析调试"), "应定位到解析调试卷");
+	handle.handleInput("\r");
+	const menu = plainOf(handle);
+	assert.ok(menu.includes("此刻"), "应有此刻选项");
+	assert.ok(menu.includes("指定时间"), "应有指定时间选项");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.6 日历删除只回退一级（不再双重 goBack）", async () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+	const ctx = drawerCtx();
+	await new PricingDrawer(path).open(ctx);
+	const handle = runDrawer(ctx.captured);
+
+	handle.handleInput("\u001b[B"); handle.handleInput("\u001b[B"); handle.handleInput("\u001b[B"); handle.handleInput("\u001b[B");
+	handle.handleInput("\r");              // 进入日历注册表
+	assert.ok(plainOf(handle).includes("模型计费配置 · 日历"));
+	handle.handleInput("\r");              // 首项 = 新建日历（unshift）→ 跳过，改测已有日历删除
+	handle.handleInput("\x1b");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+// ── v0.6 draft 校验分支 ─────────────────────────────────────────────────
+
+test("v0.6 draft.validate：缺价格 / 缺日历 / 空规则 / 缺方案 各拒绝", () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+
+	// 缺方案：绑定指向不存在的方案
+	let d = new PricingDraft(path);
+	d.addBinding("deepseek", "deepseek-flash", "valleyalways");
+	d.deletePlan("valleyalways");
+	let r = d.save();
+	assert.equal(r.ok, false, "绑定了不存在的方案应拒绝");
+	assert.ok(r.reason.includes("不存在的方案"), `原因应说明方案缺失，实际: ${r.reason}`);
+
+	// 缺价格
+	d = new PricingDraft(path);
+	d.deletePrice("peak");
+	r = d.save();
+	assert.equal(r.ok, false, "规则引用不存在的价格应拒绝");
+	assert.ok(r.reason.includes("不存在的价格"), `原因应说明价格缺失，实际: ${r.reason}`);
+
+	// 缺日历
+	d = new PricingDraft(path);
+	d.upsertCalendar("tmp", { name: "临时", dates: ["01-01"] });
+	d.upsertPlan("usescal", {
+		name: "引用日历",
+		rules: [{ schedule: { timezone: "Asia/Shanghai", weekdays: [], ranges: [], calendar: "tmp" }, price: "valley" }],
+	});
+	d.deleteCalendar("tmp");
+	r = d.save();
+	assert.equal(r.ok, false, "引用不存在的日历应拒绝");
+	assert.ok(r.reason.includes("不存在的日历"), `原因应说明日历缺失，实际: ${r.reason}`);
+
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.6 draft：新建价格/方案/日历 API", () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+
+	const d = new PricingDraft(path);
+	assert.equal(d.upsertPrice("newp", { name: "新价", input: { miss: 1, hit: 0.1 }, output: 5 }), true);
+	assert.equal(d.snapshot().prices.newp.output, 5);
+
+	assert.equal(d.upsertPlan("newplan", {
+		name: "新方案",
+		rules: [{ schedule: { timezone: "Asia/Shanghai", weekdays: [], ranges: [] }, price: "newp" }],
+	}), true);
+	assert.equal(d.snapshot().plans.newplan.rules.length, 1);
+
+	assert.equal(d.upsertCalendar("newcal", { name: "新日历", dates: ["01-01", "2026-10-01"] }), true);
+	assert.deepEqual(d.snapshot().calendars.newcal.dates, ["01-01", "2026-10-01"]);
+
+	assert.equal(d.save().ok, true, "新建后应可保存");
+	assert.ok(readPricing(path).prices.newp, "新建价格应落盘");
+	assert.ok(readPricing(path).plans.newplan, "新建方案应落盘");
+	assert.ok(readPricing(path).calendars.newcal, "新建日历应落盘");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+// ── v0.6 渲染快照（宽度不变量，零新依赖）────────────────────────────────
+
+test("v0.6 渲染：各页面在 80/120 列下均无行超宽", async () => {
+	const { visibleWidth } = await jiti.import("@earendil-works/pi-tui");
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+	const ctx = drawerCtx();
+	await new PricingDrawer(path).open(ctx);
+	const handle = runDrawer(ctx.captured);
+
+	const pages = [];
+	pages.push(["厂商列表", plainOf(handle, 80)]);
+	handle.handleInput("\r");
+	handle.handleInput("\r");
+	pages.push(["模型详情", plainOf(handle, 80)]);
+	handle.handleInput("\r");
+	pages.push(["绑定操作", plainOf(handle, 80)]);
+	handle.handleInput("\x1b");
+	handle.handleInput("\x1b");
+	handle.handleInput("\x1b");
+	handle.handleInput("\u001b[B"); handle.handleInput("\u001b[B");
+	handle.handleInput("\r");
+	pages.push(["方案注册表", plainOf(handle, 80)]);
+
+	for (const [name, text] of pages) {
+		for (const line of text.split("\n")) {
+			assert.ok(visibleWidth(line) <= 80, `${name} 存在超宽行（${visibleWidth(line)} > 80）: ${line}`);
+		}
+	}
+
+	// 120 列同样不超宽
+	for (const line of plainOf(handle, 120).split("\n")) {
+		assert.ok(visibleWidth(line) <= 120, `120 列下超宽: ${line}`);
+	}
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.6 渲染：状态栏为最后一行且含 Ctrl+S 提示", async () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+	const ctx = drawerCtx();
+	await new PricingDrawer(path).open(ctx);
+	const handle = runDrawer(ctx.captured);
+
+	const lines = plainOf(handle, 100).split("\n").filter((l) => l.trim() !== "");
+	const statusLine = lines.find((l) => l.includes("Ctrl+S"));
+	assert.ok(statusLine, "应存在含 Ctrl+S 的状态栏行");
+	assert.ok(statusLine.includes("Ctrl+R"), "状态栏应含 Ctrl+R 提示");
+	assert.ok(statusLine.includes("已保存"), "初始应为已保存态");
+	rmSync(dir, { recursive: true, force: true });
+});

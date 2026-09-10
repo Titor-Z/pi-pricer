@@ -2,8 +2,8 @@
  * /price 命令实现：v2 五注册表浏览 + 绑定管理 + 调试。
  *
  * 接线层：pi.registerCommand → pricing-ui（抽屉）+ pricing-store +
- * pricing-query + pricing-format。编辑主链路在 TUI 抽屉（M2/M3），
- * CLI 保留查询/绑定/兜底操作。
+ * pricing-query + pricing-format。编辑主链路在 TUI 抽屉（draft + Ctrl+S 保存），
+ * CLI 提供等价能力（headless 可完整操作）：查询/绑定/move/管理面 CRUD/调试。
  */
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";

@@ -17,11 +17,10 @@ import {
 	type Component,
 	type SettingItem,
 } from "@earendil-works/pi-tui";
-import { listProviderRows, listProviderPlans } from "./pricing-builder.ts";import { renderModelDetail, renderPlanDetail, renderPriceRegistry, renderCalendarList, renderResolveResult } from "./pricing-format.ts";
-import { resolveDebug } from "./pricing-query.ts";
+import { listProviderRows, listProviderPlans } from "./pricing-builder.ts";
+import { renderModelDetail, renderResolveResult } from "./pricing-format.ts";
 import { PricingDraft } from "./pricing-draft.ts";
 import { describeSchedule, price } from "./pricing-desc.ts";
-import type { PricingSchema } from "./pricing-types.ts";
 
 /** 抽屉第 0 级的标题（返回厂商列表时恢复） */
 const ROOT_TITLE = "模型计费配置 · 厂商";
@@ -37,10 +36,9 @@ interface DrawerTheme {
 	bold: (text: string) => string;
 }
 
-/** 可传入的 TUI 子集（只用到 showOverlay / setFocus） */
+/** 可传入的 TUI 子集（只用到 showOverlay 弹输入层） */
 interface DrawerTui {
 	showOverlay?: (component: Component, options?: unknown) => { hide?: () => void };
-	setFocus?: (component: Component | null) => void;
 }
 
 /**
@@ -84,6 +82,16 @@ class ActionMenu implements Component {
 	}
 }
 
+/** 校验解析时间输入："YYYY-MM-DDTHH:mm"（也接受 "YYYY-MM-DD"，按当天 12:00） */
+function parseDateTimeInput(raw: string): Date | null {
+	const text = raw.trim();
+	if (text === "") return null;
+	const normalized = /^\d{4}-\d{2}-\d{2}$/.test(text) ? `${text}T12:00` : text;
+	if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(normalized)) return null;
+	const date = new Date(`${normalized}:00`);
+	return Number.isNaN(date.getTime()) ? null : date;
+}
+
 /** 校验价格输入：支持 "4"、"4.5"、"¥0.02" */
 function parsePriceInput(raw: string): number | null {
 	const cleaned = raw.replace(/^¥/, "").trim();
@@ -116,29 +124,53 @@ export class PricingDrawer {
 		const draft = new PricingDraft(this.filePath);
 		const container = new Container();
 		const title = new Text(theme.fg("accent", theme.bold(ROOT_TITLE)), 1, 1);
-		/** 换标题并强制重绘（submenu 钻取/返回时调用）；同时更新子菜单状态 */
+
+		/**
+		 * 当前钻取深度：根层为 0，每进一级 +1。
+		 * 为什么不用标题反推：标题是展示层状态，用它决定 Esc 归属会把展示与逻辑耦合，
+		 * 一旦某子页标题与根标题相同就会误判。深度计数是唯一的逻辑真相。
+		 */
+		let depth = 0;
+
+		/** 换标题并强制重绘（纯展示，不承担状态推断） */
 		const setTitle = (text: string): void => {
-			insideSubmenu = text !== ROOT_TITLE;
 			title.setText(theme.fg("accent", theme.bold(text)));
 			container.invalidate();
 		};
 
-		/** 状态栏文案：未保存改动 / 保存结果提示 */
-		let status = "";
+		/** 进入子级：深度 +1 */
+		const enterLevel = (): void => {
+			depth += 1;
+		};
+
+		/** 返回上级：深度 -1（不低于 0） */
+		const leaveLevel = (): void => {
+			depth = Math.max(0, depth - 1);
+		};
+
+		/** 状态栏最近一次提示文案（与 refreshStatus 的参数区分，避免同名遮蔽） */
+		let lastMessage = "";
 		const statusText = new Text("", 1, 0);
 		const refreshStatus = (message = ""): void => {
-			status = message;
+			lastMessage = message;
 			const dirty = draft.isDirty;
 			const left = dirty ? theme.fg("warning", `● 未保存改动（${draft.changedAreas.join("、")}）`) : theme.fg("success", "✓ 已保存");
-			const detail = status ? `   ${status}` : "";
+			const detail = lastMessage ? `   ${lastMessage}` : "";
 			const keys = theme.fg("dim", "  Ctrl+S 保存 · Ctrl+R 重置 · Esc 返回");
 			statusText.setText(`${left}${detail}${keys}`);
 			container.invalidate();
 		};
 
+		/**
+		 * Esc 已提示过"放弃退出"？有未保存改动时第一次 Esc 只提示，第二次才真正退出。
+		 * 没有这个状态位会导致提示后仍然退不出（isDirty 恒真，每次 Esc 都走提示分支）。
+		 */
+		let escHintShown = false;
+
 		/** 保存：校验失败只提示，不退出编辑器 */
 		const save = (): void => {
 			const result = draft.save();
+			escHintShown = false;
 			refreshStatus(result.ok ? "已写入 ~/.pi/model-pricing.json" : theme.fg("error", `保存被拒：${result.reason}`));
 			if (result.ok) rebuildRoot();
 		};
@@ -146,21 +178,34 @@ export class PricingDrawer {
 		/** 重置：丢弃未保存改动 */
 		const reset = (): void => {
 			draft.reset();
+			escHintShown = false;
 			rebuildRoot();
 			refreshStatus("已丢弃未保存改动");
 		};
 
 		let rootList: SettingsList | null = null;
+
 		/**
-		 * 当前是否处于子菜单（submenu 展开时 Esc 归子级，根层不拦截）。
-		 * SettingsList 不暴露该状态，这里借标题层级推断：标题回到 ROOT_TITLE 即回到根层。
+		 * 临时页栈：在 ActionMenu 之上再叠一层只读页（如解析结果）。
+		 * 顶层 handleInput 优先派发给栈顶；Esc 由栈顶的 handleInput 触发 popPage 出栈。
 		 */
-		let insideSubmenu = false;
+		const pageStack: Component[] = [];
+		const popPage = (): void => {
+			const top = pageStack.pop();
+			if (!top) return;
+			container.removeChild(top);
+			container.invalidate();
+		};
+		const pushPage = (component: Component): void => {
+			pageStack.push(component);
+			container.addChild(component);
+			container.invalidate();
+		};
 
 		/** 重建厂商列表（保存/重置后价格列需要刷新） */
 		const rebuildRoot = (): void => {
 			if (rootList) container.removeChild(rootList);
-			rootList = this.buildProviderList(draft, tui, theme, setTitle, refreshStatus, close);
+			rootList = this.buildProviderList(draft, tui, theme, setTitle, refreshStatus, enterLevel, leaveLevel, pushPage, popPage, close);
 			container.addChild(rootList);
 			container.invalidate();
 		};
@@ -186,9 +231,20 @@ export class PricingDrawer {
 					reset();
 					return;
 				}
-				// 根层 Esc + 有未保存改动：先提示如何处置，避免误退出丢改动
-				if (kb.matches(data, "tui.select.cancel") && draft.isDirty && !insideSubmenu) {
-					refreshStatus(theme.fg("warning", "有未保存改动：Ctrl+S 保存 / Ctrl+R 重置 / 再按 Esc 放弃退出"));
+				// 根层 Esc + 有未保存改动：第一次提示，第二次（escHintShown）丢弃并退出
+				if (kb.matches(data, "tui.select.cancel") && draft.isDirty && depth === 0) {
+					if (!escHintShown) {
+						escHintShown = true;
+						refreshStatus(theme.fg("warning", "有未保存改动：Ctrl+S 保存 / Ctrl+R 重置 / 再按 Esc 放弃退出"));
+						return;
+					}
+					close();
+					return;
+				}
+				// 临时页栈优先；栈顶的 buildTextPage 在 Esc 时会调用 popPage
+				const top = pageStack[pageStack.length - 1];
+				if (top) {
+					top.handleInput?.(data);
 					return;
 				}
 				rootList?.handleInput?.(data);
@@ -203,6 +259,10 @@ export class PricingDrawer {
 		theme: DrawerTheme,
 		setTitle: (text: string) => void,
 		refreshStatus: (msg?: string) => void,
+		enterLevel: () => void,
+		leaveLevel: () => void,
+		pushPage: (component: Component) => void,
+		popPage: () => void,
 		close: () => void,
 	): SettingsList {
 		const rows = listProviderRows(this.filePath);
@@ -212,9 +272,11 @@ export class PricingDrawer {
 			currentValue: "",
 			description: row.description,
 			submenu: (_currentValue, done) => {
+				enterLevel();
 				setTitle(levelTitle(row.providerId));
-				return this.buildModelList(draft, tui, theme, row.providerId, setTitle, refreshStatus, () => {
+				return this.buildModelList(draft, tui, theme, row.providerId, setTitle, refreshStatus, enterLevel, leaveLevel, pushPage, popPage, () => {
 					setTitle(ROOT_TITLE);
+					leaveLevel();
 					done(undefined);
 				});
 			},
@@ -227,9 +289,11 @@ export class PricingDrawer {
 			currentValue: `${Object.keys(draft.snapshot().plans).length} 个`,
 			description: "计费方案：规则顺序即优先级（first match wins）",
 			submenu: (_v, done) => {
-				setTitle("模型计费配置 · 方案");
-				return this.buildPlanRegistry(draft, tui, theme, setTitle, refreshStatus, () => {
+				enterLevel();
+				setTitle(levelTitle("方案"));
+				return this.buildPlanRegistry(draft, tui, theme, setTitle, refreshStatus, enterLevel, leaveLevel, () => {
 					setTitle(ROOT_TITLE);
+					leaveLevel();
 					done(undefined);
 				});
 			},
@@ -240,9 +304,11 @@ export class PricingDrawer {
 			currentValue: `${Object.keys(draft.snapshot().prices).length} 个`,
 			description: "可复用价格实体（¥/百万 token）",
 			submenu: (_v, done) => {
-				setTitle("模型计费配置 · 价格");
-				return this.buildPriceRegistry(draft, tui, theme, setTitle, refreshStatus, () => {
+				enterLevel();
+				setTitle(levelTitle("价格"));
+				return this.buildPriceRegistry(draft, tui, theme, setTitle, refreshStatus, enterLevel, leaveLevel, () => {
 					setTitle(ROOT_TITLE);
+					leaveLevel();
 					done(undefined);
 				});
 			},
@@ -253,9 +319,11 @@ export class PricingDrawer {
 			currentValue: `${Object.keys(draft.snapshot().calendars).length} 个`,
 			description: "节假日/特殊日期资源，可被 schedule 引用",
 			submenu: (_v, done) => {
-				setTitle("模型计费配置 · 日历");
-				return this.buildCalendarRegistry(draft, tui, theme, setTitle, () => {
+				enterLevel();
+				setTitle(levelTitle("日历"));
+				return this.buildCalendarRegistry(draft, tui, theme, refreshStatus, enterLevel, leaveLevel, () => {
 					setTitle(ROOT_TITLE);
+					leaveLevel();
 					done(undefined);
 				});
 			},
@@ -278,6 +346,10 @@ export class PricingDrawer {
 		providerId: string,
 		setTitle: (text: string) => void,
 		refreshStatus: (msg?: string) => void,
+		enterLevel: () => void,
+		leaveLevel: () => void,
+		pushPage: (component: Component) => void,
+		popPage: () => void,
 		goBack: () => void,
 	): SettingsList {
 		const schema = draft.snapshot();
@@ -291,11 +363,13 @@ export class PricingDrawer {
 				currentValue: "",
 				description: `${providerId}/${modelId}：绑定 ${conf.plans.length} 个方案，启用 ${enabledCount} 个`,
 				submenu: (_currentValue, done) => {
+					enterLevel();
 					setTitle(levelTitle(`${providerId}/${modelId}`));
-					return this.buildModelDetail(draft, tui, theme, providerId, modelId, setTitle, refreshStatus, () => {
+					return this.buildModelDetail(draft, tui, theme, providerId, modelId, setTitle, refreshStatus, enterLevel, leaveLevel, () => {
 						setTitle(levelTitle(providerId));
+						leaveLevel();
 						done(undefined);
-					});
+					}, pushPage, popPage);
 				},
 			};
 		});
@@ -318,7 +392,11 @@ export class PricingDrawer {
 		modelId: string,
 		setTitle: (text: string) => void,
 		refreshStatus: (msg?: string) => void,
+		enterLevel: () => void,
+		leaveLevel: () => void,
 		goBack: () => void,
+		pushPage: (component: Component) => void,
+		popPage: () => void,
 	): SettingsList {
 		const schema = draft.snapshot();
 		const conf = schema.providers[providerId]?.models[modelId];
@@ -329,22 +407,27 @@ export class PricingDrawer {
 			return new SettingsList(items, 6, getSettingsListTheme(), () => {}, goBack);
 		}
 
-		// 每条绑定：Enter 进入该项的操作子菜单
-		for (const binding of conf.plans) {
+		// 每条绑定：Enter 进入该项的操作子菜单；#N = 优先级序号（数组顺序即优先级）
+		conf.plans.forEach((binding, order) => {
 			const plan = schema.plans[binding.plan];
+			const firstHint = order === 0 ? " ← 先匹配" : "";
 			items.push({
 				id: `bind:${binding.plan}`,
-				label: `${binding.enabled ? "◉" : "◌"} ${plan?.name ?? binding.plan}`,
+				label: `#${order + 1} ${binding.enabled ? "◉" : "◌"} ${plan?.name ?? binding.plan}`,
 				currentValue: binding.enabled ? "已启用" : "已禁用",
 				description: plan
-					? `${binding.plan}：${plan.rules.map((r) => describeSchedule(r.schedule)).join(" ; ")}`
+					? `优先级 #${order + 1}${firstHint}｜${binding.plan}：${plan.rules.map((r) => describeSchedule(r.schedule)).join(" ; ")}｜排序用 /price move`
 					: `${binding.plan}（方案不存在）`,
-				submenu: (_v, done) => this.buildBindingActions(draft, theme, providerId, modelId, binding.plan, refreshStatus, () => {
-					setTitle(levelTitle(`${providerId}/${modelId}`));
-					done(undefined);
-				}),
+				submenu: (_v, done) => {
+					enterLevel();
+					return this.buildBindingActions(draft, theme, providerId, modelId, binding.plan, refreshStatus, () => {
+						setTitle(levelTitle(`${providerId}/${modelId}`));
+						leaveLevel();
+						done(undefined);
+					});
+				},
 			});
-		}
+		});
 
 		// 追加绑定
 		const unbound = listProviderPlans().filter((p) => !conf.plans.some((b) => b.plan === p.id));
@@ -354,7 +437,14 @@ export class PricingDrawer {
 				label: "＋ 绑定新方案",
 				currentValue: `${unbound.length} 可选`,
 				description: "选择后追加到末尾（最低优先级）；排序用 /price move",
-				submenu: (_v, done) => this.buildAddBinding(draft, theme, providerId, modelId, unbound, refreshStatus, done),
+				submenu: (_v, done) => {
+					enterLevel();
+					const inner = done;
+					return this.buildAddBinding(draft, theme, providerId, modelId, unbound, refreshStatus, () => {
+						leaveLevel();
+						inner(undefined);
+					});
+				},
 			});
 		}
 
@@ -364,21 +454,54 @@ export class PricingDrawer {
 			label: "别名（台账匹配）",
 			currentValue: conf.alias ?? "（未设置）",
 			description: "pi 内部 model 名的别名，用于 pi-prompt / pi-usage 台账匹配",
-			submenu: (_v, done) => this.buildAliasInput(tui, theme, draft, providerId, modelId, refreshStatus, done),
-		});
-
-		// 解析调试（实时命中链）
-		items.push({
-			id: "__resolve",
-			label: "解析调试（当前命中链）",
-			currentValue: "",
-			description: "展示 first-match 过程：哪条规则命中/未中及原因",
 			submenu: (_v, done) => {
-				setTitle(levelTitle(`${providerId}/${modelId}/resolve`));
-				return this.buildTextPage(renderResolveResult(modelId, providerId, undefined, this.filePath), () => {
-					setTitle(levelTitle(`${providerId}/${modelId}`));
+				enterLevel();
+				return this.buildAliasInput(tui, theme, draft, providerId, modelId, refreshStatus, () => {
+					leaveLevel();
 					done(undefined);
 				});
+			},
+		});
+
+		// 解析调试（可选时刻：预演某个时间点会命中哪档价）
+		items.push({
+			id: "__resolve",
+			label: "解析调试（预演某时刻命中链）",
+			currentValue: "",
+			description: "展示 first-match 过程；可指定时间预演（如明天 10 点走哪档）",
+			submenu: (_v, done) => {
+				enterLevel();
+				const finish = (): void => { leaveLevel(); done(undefined); };
+				/** 用给定时刻打开只读命中链页（undefined = 当前时刻） */
+				const showChain = (at?: Date): void => {
+					const body = renderResolveResult(modelId, providerId, at, this.filePath);
+					setTitle(levelTitle(`${providerId}/${modelId}/resolve`));
+					pushPage(this.buildTextPage(body, () => {
+						popPage();
+						setTitle(levelTitle(`${providerId}/${modelId}`));
+					}));
+				};
+				return new ActionMenu(
+					`解析调试 ${providerId}/${modelId}`,
+					[
+						{ label: "此刻", detail: "用当前时间解析", run: () => showChain(undefined) },
+						{
+							label: "指定时间…",
+							detail: "YYYY-MM-DDTHH:mm",
+							run: () => this.askText(tui, "解析时间（YYYY-MM-DDTHH:mm）", "2026-09-16T10:00", (value) => {
+								const parsed = parseDateTimeInput(value);
+								if (!parsed) {
+									refreshStatus(theme.fg("error", `无效时间: ${value}（格式 YYYY-MM-DDTHH:mm）`));
+									finish();
+									return;
+								}
+								showChain(parsed);
+							}),
+						},
+					],
+					theme,
+					() => { setTitle(levelTitle(`${providerId}/${modelId}`)); finish(); },
+				);
 			},
 		});
 
@@ -389,9 +512,10 @@ export class PricingDrawer {
 			currentValue: "",
 			description: "含基准/覆盖档与实时生效价",
 			submenu: (_v, done) => {
-				setTitle(levelTitle(`${providerId}/${modelId}`));
+				enterLevel();
 				return this.buildTextPage(renderModelDetail(providerId, modelId, this.filePath), () => {
 					setTitle(levelTitle(`${providerId}/${modelId}`));
+					leaveLevel();
 					done(undefined);
 				});
 			},
@@ -499,6 +623,8 @@ export class PricingDrawer {
 		theme: DrawerTheme,
 		setTitle: (text: string) => void,
 		refreshStatus: (msg?: string) => void,
+		enterLevel: () => void,
+		leaveLevel: () => void,
 		goBack: () => void,
 	): SettingsList {
 		const schema = draft.snapshot();
@@ -508,13 +634,40 @@ export class PricingDrawer {
 			currentValue: `${plan.rules.length} 规则`,
 			description: `${planId}：${plan.rules.map((r) => describeSchedule(r.schedule)).join(" ; ")}`,
 			submenu: (_v, done) => {
+				enterLevel();
 				setTitle(levelTitle(`方案/${planId}`));
-				return this.buildPlanActions(draft, tui, theme, planId, setTitle, refreshStatus, () => {
+				return this.buildPlanActions(draft, tui, theme, planId, setTitle, refreshStatus, enterLevel, leaveLevel, () => {
 					setTitle(levelTitle("方案"));
+					leaveLevel();
 					done(undefined);
 				});
 			},
 		}));
+
+		items.unshift({
+			id: "__newplan",
+			label: "＋ 新建方案",
+			currentValue: "",
+			description: "新建空方案（默认挂首个价格实体的一条 always 规则）",
+			submenu: (_v, done) => {
+				enterLevel();
+				const finish = (): void => { leaveLevel(); done(undefined); };
+				this.askText(tui, "新方案 id（如 my-plan）", "my-plan", (planId) => {
+					const id = planId.trim();
+					if (id === "") { refreshStatus(theme.fg("error", "方案 id 不能为空")); finish(); return; }
+					if (draft.snapshot().plans[id]) { refreshStatus(theme.fg("error", `方案已存在: ${id}`)); finish(); return; }
+					const firstPrice = Object.keys(draft.snapshot().prices)[0];
+					if (!firstPrice) { refreshStatus(theme.fg("error", "价格注册表为空，请先新建价格实体")); finish(); return; }
+					draft.upsertPlan(id, {
+						name: id,
+						rules: [{ schedule: { timezone: "Asia/Shanghai", weekdays: [], ranges: [] }, price: firstPrice }],
+					});
+					refreshStatus(`已新建方案 ${id}（默认挂 ${firstPrice}；Ctrl+S 保存）`);
+					finish();
+				});
+				return this.buildTextPage("正在输入新方案 id…", finish);
+			},
+		});
 		return new SettingsList(items, Math.min(items.length + 4, 12), getSettingsListTheme(), () => {}, goBack, { enableSearch: true });
 	}
 
@@ -526,6 +679,8 @@ export class PricingDrawer {
 		planId: string,
 		setTitle: (text: string) => void,
 		refreshStatus: (msg?: string) => void,
+		enterLevel: () => void,
+		leaveLevel: () => void,
 		goBack: () => void,
 	): SettingsList {
 		const plan = draft.snapshot().plans[planId];
@@ -544,9 +699,11 @@ export class PricingDrawer {
 				currentValue: p ? price(p.output) : rule.price,
 				description: `${describeSchedule(rule.schedule)}${rule.validUntil ? ` · 有效期至 ${rule.validUntil}` : ""}`,
 				submenu: (_v, done) => {
+					enterLevel();
 					setTitle(levelTitle(`方案/${planId}/规则#${i}`));
-					return this.buildRuleActions(draft, tui, theme, planId, i, refreshStatus, () => {
+					return this.buildRuleActions(draft, tui, theme, planId, i, refreshStatus, enterLevel, leaveLevel, () => {
 						setTitle(levelTitle(`方案/${planId}`));
+						leaveLevel();
 						done(undefined);
 					});
 				},
@@ -558,28 +715,32 @@ export class PricingDrawer {
 			label: "方案操作（追加规则 / 复制 / 删除）",
 			currentValue: "",
 			description: "追加规则、复制方案、删除方案",
-			submenu: (_v, done) => new ActionMenu(
+			submenu: (_v, done) => {
+				enterLevel();
+				const finish = (): void => { leaveLevel(); done(undefined); };
+				return new ActionMenu(
 				`方案 ${planId} 操作`,
 				[
 					{
 						label: "＋ 追加规则",
 						detail: "复制最后一条规则的形状",
-						run: () => { draft.addRule(planId); refreshStatus("已追加规则（Ctrl+S 保存）"); done(undefined); },
+						run: () => { draft.addRule(planId); refreshStatus("已追加规则（Ctrl+S 保存）"); finish(); },
 					},
 					{
 						label: "复制方案",
 						detail: "生成 <id>-copy",
-						run: () => { const n = draft.duplicatePlan(planId); refreshStatus(n ? `已复制为 ${n}（Ctrl+S 保存）` : "复制失败"); done(undefined); },
+						run: () => { const n = draft.duplicatePlan(planId); refreshStatus(n ? `已复制为 ${n}（Ctrl+S 保存）` : "复制失败"); finish(); },
 					},
 					{
 						label: "删除方案",
 						detail: "被模型绑定时会拒绝保存",
-						run: () => { draft.deletePlan(planId); refreshStatus(`已删除方案 ${planId}（Ctrl+S 保存）`); done(undefined); },
+						run: () => { draft.deletePlan(planId); refreshStatus(`已删除方案 ${planId}（Ctrl+S 保存）`); finish(); },
 					},
 				],
 				theme,
-				() => done(undefined),
-			),
+				finish,
+			);
+			},
 		});
 
 		return new SettingsList(items, Math.min(items.length + 4, 14), getSettingsListTheme(), () => {}, goBack);
@@ -593,6 +754,8 @@ export class PricingDrawer {
 		planId: string,
 		ruleIndex: number,
 		refreshStatus: (msg?: string) => void,
+		enterLevel: () => void,
+		leaveLevel: () => void,
 		goBack: () => void,
 	): SettingsList {
 		const rule = draft.snapshot().plans[planId]?.rules[ruleIndex];
@@ -613,17 +776,19 @@ export class PricingDrawer {
 			currentValue: rule?.validUntil ?? "无",
 			description: "YYYY-MM-DD，过期后规则不参与匹配（留空清除）",
 			submenu: (_v, done) => {
+				enterLevel();
+				const finish = (): void => { leaveLevel(); done(undefined); };
 				this.askText(tui, "规则有效期（YYYY-MM-DD，留空清除）", rule?.validUntil ?? "", (value) => {
 					if (value !== "" && !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
 						refreshStatus(theme.fg("error", `无效日期: ${value}（需 YYYY-MM-DD）`));
-						done(undefined);
+						finish();
 						return;
 					}
 					draft.setRuleValidUntil(planId, ruleIndex, value);
 					refreshStatus(`规则 #${ruleIndex} 有效期设为 ${value || "无"}（Ctrl+S 保存）`);
-					done(undefined);
+					finish();
 				});
-				return this.buildTextPage("编辑器已打开（若终端不支持覆盖层，请改用 /price plan 命令）", () => done(undefined));
+				return this.buildTextPage("编辑器已打开（若终端不支持覆盖层，请改用 /price plan 命令）", finish);
 			},
 		});
 		items.push({
@@ -631,23 +796,27 @@ export class PricingDrawer {
 			label: "删除该规则",
 			currentValue: "",
 			description: "方案至少保留一条规则",
-			submenu: (_v, done) => new ActionMenu(
-				`删除规则 #${ruleIndex}？`,
-				[{
-					label: "确认删除",
-					detail: "方案至少保留一条规则",
-					run: () => {
-						if (!draft.removeRule(planId, ruleIndex)) {
-							refreshStatus(theme.fg("error", "删除失败：方案至少保留一条规则"));
-						} else {
-							refreshStatus(`已删除规则 #${ruleIndex}（Ctrl+S 保存）`);
-						}
-						done(undefined);
-					},
-				}],
-				theme,
-				() => done(undefined),
-			),
+			submenu: (_v, done) => {
+				enterLevel();
+				const finish = (): void => { leaveLevel(); done(undefined); };
+				return new ActionMenu(
+					`删除规则 #${ruleIndex}？`,
+					[{
+						label: "确认删除",
+						detail: "方案至少保留一条规则",
+						run: () => {
+							if (!draft.removeRule(planId, ruleIndex)) {
+								refreshStatus(theme.fg("error", "删除失败：方案至少保留一条规则"));
+							} else {
+								refreshStatus(`已删除规则 #${ruleIndex}（Ctrl+S 保存）`);
+							}
+							finish();
+						},
+					}],
+					theme,
+					finish,
+				);
+			},
 		});
 
 		return new SettingsList(items, Math.min(items.length + 4, 14), getSettingsListTheme(), (id) => {
@@ -666,6 +835,8 @@ export class PricingDrawer {
 		theme: DrawerTheme,
 		setTitle: (text: string) => void,
 		refreshStatus: (msg?: string) => void,
+		enterLevel: () => void,
+		leaveLevel: () => void,
 		goBack: () => void,
 	): SettingsList {
 		const items: SettingItem[] = Object.entries(draft.snapshot().prices).map(([priceId, entity]) => ({
@@ -673,18 +844,42 @@ export class PricingDrawer {
 			label: `${entity.name}`,
 			currentValue: price(entity.output),
 			description: `${priceId}：输出 ${price(entity.output)} · 输入 未缓存 ${price(entity.input.miss)} / 缓存 ${price(entity.input.hit)}`,
-			submenu: (_v, done) => new ActionMenu(
-				`价格 ${priceId}（${entity.name}）`,
-				[
-					{ label: "改输出价", detail: price(entity.output), run: () => { this.askPriceField(tui, theme, draft, priceId, "output", "输出价（¥/百万 token）", refreshStatus, done); } },
-					{ label: "改未缓存输入价", detail: price(entity.input.miss), run: () => { this.askPriceField(tui, theme, draft, priceId, "input.miss", "未缓存输入价（¥/百万 token）", refreshStatus, done); } },
-					{ label: "改缓存命中输入价", detail: price(entity.input.hit), run: () => { this.askPriceField(tui, theme, draft, priceId, "input.hit", "缓存命中输入价（¥/百万 token）", refreshStatus, done); } },
-					{ label: "删除该价格", detail: "被规则引用时保存会被拒", run: () => { draft.deletePrice(priceId); refreshStatus(`已删除价格 ${priceId}（Ctrl+S 保存）`); done(undefined); } },
-				],
-				theme,
-				() => done(undefined),
-			),
+			submenu: (_v, done) => {
+				enterLevel();
+				const finish = (): void => { leaveLevel(); done(undefined); };
+				return new ActionMenu(
+					`价格 ${priceId}（${entity.name}）`,
+					[
+						{ label: "改输出价", detail: price(entity.output), run: () => { this.askPriceField(tui, theme, draft, priceId, "output", "输出价（¥/百万 token）", refreshStatus, finish); } },
+						{ label: "改未缓存输入价", detail: price(entity.input.miss), run: () => { this.askPriceField(tui, theme, draft, priceId, "input.miss", "未缓存输入价（¥/百万 token）", refreshStatus, finish); } },
+						{ label: "改缓存命中输入价", detail: price(entity.input.hit), run: () => { this.askPriceField(tui, theme, draft, priceId, "input.hit", "缓存命中输入价（¥/百万 token）", refreshStatus, finish); } },
+						{ label: "删除该价格", detail: "被规则引用时保存会被拒", run: () => { draft.deletePrice(priceId); refreshStatus(`已删除价格 ${priceId}（Ctrl+S 保存）`); finish(); } },
+					],
+					theme,
+					finish,
+				);
+			},
 		}));
+
+		items.unshift({
+			id: "__newprice",
+			label: "＋ 新建价格实体",
+			currentValue: "",
+			description: "新建价格实体（初值 0，建后用菜单改数值）",
+			submenu: (_v, done) => {
+				enterLevel();
+				const finish = (): void => { leaveLevel(); done(undefined); };
+				this.askText(tui, "新价格实体 id（如 vendor-peak）", "vendor-peak", (priceId) => {
+					const id = priceId.trim();
+					if (id === "") { refreshStatus(theme.fg("error", "价格 id 不能为空")); finish(); return; }
+					if (draft.snapshot().prices[id]) { refreshStatus(theme.fg("error", `价格实体已存在: ${id}`)); finish(); return; }
+					draft.upsertPrice(id, { name: id, input: { miss: 0, hit: 0 }, output: 0 });
+					refreshStatus(`已新建价格 ${id}（初值 0，请改数值；Ctrl+S 保存）`);
+					finish();
+				});
+				return this.buildTextPage("正在输入新价格实体 id…", finish);
+			},
+		});
 		return new SettingsList(items, Math.min(items.length + 4, 12), getSettingsListTheme(), () => {}, goBack, { enableSearch: true });
 	}
 
@@ -719,7 +914,9 @@ export class PricingDrawer {
 		draft: PricingDraft,
 		tui: DrawerTui,
 		theme: DrawerTheme,
-		setTitle: (text: string) => void,
+		refreshStatus: (msg?: string) => void,
+		enterLevel: () => void,
+		leaveLevel: () => void,
 		goBack: () => void,
 	): SettingsList {
 		const items: SettingItem[] = Object.entries(draft.snapshot().calendars).map(([calId, entry]) => ({
@@ -727,19 +924,47 @@ export class PricingDrawer {
 			label: `${entry.name}`,
 			currentValue: `${entry.dates.length} 天`,
 			description: `${calId}：${entry.dates.slice(0, 6).join("、")}${entry.dates.length > 6 ? " …" : ""}`,
-			submenu: (_v, done) => new ActionMenu(
-				`日历 ${calId}（${entry.name}）`,
-				[{
-					label: "删除该日历",
-					detail: "被规则引用时保存会被拒",
-					run: () => { draft.deleteCalendar(calId); goBack(); done(undefined); },
-				}],
-				theme,
-				() => done(undefined),
-			),
+			submenu: (_v, done) => {
+				enterLevel();
+				const finish = (): void => { leaveLevel(); done(undefined); };
+				return new ActionMenu(
+					`日历 ${calId}（${entry.name}）`,
+					[{
+						label: "删除该日历",
+						detail: "被规则引用时保存会被拒",
+						run: () => { draft.deleteCalendar(calId); refreshStatus(`已删除日历 ${calId}（Ctrl+S 保存）`); finish(); },
+					}],
+					theme,
+					finish,
+				);
+			},
 		}));
-		void setTitle;
-		void tui;
+
+		items.unshift({
+			id: "__newcal",
+			label: "＋ 新建日历",
+			currentValue: "",
+			description: "新建日历（逗号分隔日期，支持 YYYY-MM-DD 与 MM-DD）",
+			submenu: (_v, done) => {
+				enterLevel();
+				const finish = (): void => { leaveLevel(); done(undefined); };
+				this.askText(tui, "新日历 id（如 cn-holiday）", "cn-holiday", (calId) => {
+					const id = calId.trim();
+					if (id === "") { refreshStatus(theme.fg("error", "日历 id 不能为空")); finish(); return; }
+					if (draft.snapshot().calendars[id]) { refreshStatus(theme.fg("error", `日历已存在: ${id}`)); finish(); return; }
+					this.askText(tui, `${id} 的日期（逗号分隔）`, "01-01, 10-01", (rawDates) => {
+						const dates = rawDates.split(/[,，\s]+/).filter(Boolean);
+						if (dates.length === 0) { refreshStatus(theme.fg("error", "至少需要一个日期")); finish(); return; }
+						const bad = dates.find((d) => !/^(\d{4}-)?\d{2}-\d{2}$/.test(d));
+						if (bad) { refreshStatus(theme.fg("error", `无效日期: ${bad}（需 YYYY-MM-DD 或 MM-DD）`)); finish(); return; }
+						draft.upsertCalendar(id, { name: id, dates });
+						refreshStatus(`已新建日历 ${id}（${dates.length} 天；Ctrl+S 保存）`);
+						finish();
+					});
+				});
+				return this.buildTextPage("正在输入新日历信息…", finish);
+			},
+		});
 		return new SettingsList(items, Math.min(items.length + 4, 12), getSettingsListTheme(), () => {}, goBack, { enableSearch: true });
 	}
 
@@ -773,4 +998,5 @@ export class PricingDrawer {
 			},
 		};
 	}
+
 }

@@ -104,6 +104,9 @@ function parsePriceInput(raw: string): number | null {
  * 三级钻取抽屉：独立于命令层，filePath 注入便于测试；不访问 pi ExtensionAPI。
  */
 export class PricingDrawer {
+	/** 当前场景的 overlay 句柄槽（buildScene 装配，askText 读写） */
+	private overlaySlot?: { current: { hide: () => void; dispose?: () => void } | null };
+
 	constructor(private readonly filePath?: string) {}
 
 	/** 打开抽屉；无 custom UI 时返回 false，交给命令层回退文本输出 */
@@ -121,6 +124,9 @@ export class PricingDrawer {
 	 * Ctrl+S / Ctrl+R 在顶层拦截，保证任意层级都能保存/重置。
 	 */
 	private buildScene(tui: DrawerTui, theme: DrawerTheme, close: () => void): Component {
+		// 场景级 overlay 句柄槽：askText 由各 builders 调用，需要访问同一份打开状态
+		const overlaySlot: { current: { hide: () => void; dispose?: () => void } | null } = { current: null };
+		this.overlaySlot = overlaySlot;
 		const draft = new PricingDraft(this.filePath);
 		const container = new Container();
 		const title = new Text(theme.fg("accent", theme.bold(ROOT_TITLE)), 1, 1);
@@ -186,8 +192,22 @@ export class PricingDrawer {
 		let rootList: SettingsList | null = null;
 
 		/**
+		 * 是否有输入覆盖层打开（同一时刻最多一个）。
+		 * 为什么需要这个标记：ExtensionInputComponent 的 Esc 走 onCancel，
+		 * 若 onCancel 里不关闭覆盖层，它会永久残留在屏幕上（"卡屏"）；
+		 * 同时底层组件也不应在覆盖层打开时响应按键。
+		 */
+		const hasOverlay = (): boolean => overlaySlot.current !== null;
+
+		/** 关闭当前输入覆盖层（幂等；submit 与 cancel 两条路径都必须调用） */
+		const closeOverlay = (): void => {
+			this.closeOverlay();
+		};
+
+		/**
 		 * 临时页栈：在 ActionMenu 之上再叠一层只读页（如解析结果）。
 		 * 顶层 handleInput 优先派发给栈顶；Esc 由栈顶的 handleInput 触发 popPage 出栈。
+		 * 与 overlay 的分工：pageStack = 只读页（读），overlay = 输入层（写），二者互斥。
 		 */
 		const pageStack: Component[] = [];
 		const popPage = (): void => {
@@ -241,6 +261,8 @@ export class PricingDrawer {
 					close();
 					return;
 				}
+				// 输入覆盖层打开时：底层（pageStack / rootList）一律不响应，避免同一按键双重处理
+				if (hasOverlay()) return;
 				// 临时页栈优先；栈顶的 buildTextPage 在 Esc 时会调用 popPage
 				const top = pageStack[pageStack.length - 1];
 				if (top) {
@@ -496,7 +518,7 @@ export class PricingDrawer {
 									return;
 								}
 								showChain(parsed);
-							}),
+							}, () => refreshStatus("已取消输入")),
 						},
 					],
 					theme,
@@ -664,7 +686,7 @@ export class PricingDrawer {
 					});
 					refreshStatus(`已新建方案 ${id}（默认挂 ${firstPrice}；Ctrl+S 保存）`);
 					finish();
-				});
+				}, () => { refreshStatus("已取消新建方案"); finish(); });
 				return this.buildTextPage("正在输入新方案 id…", finish);
 			},
 		});
@@ -787,7 +809,7 @@ export class PricingDrawer {
 					draft.setRuleValidUntil(planId, ruleIndex, value);
 					refreshStatus(`规则 #${ruleIndex} 有效期设为 ${value || "无"}（Ctrl+S 保存）`);
 					finish();
-				});
+				}, () => { refreshStatus("已取消输入"); finish(); });
 				return this.buildTextPage("编辑器已打开（若终端不支持覆盖层，请改用 /price plan 命令）", finish);
 			},
 		});
@@ -876,7 +898,7 @@ export class PricingDrawer {
 					draft.upsertPrice(id, { name: id, input: { miss: 0, hit: 0 }, output: 0 });
 					refreshStatus(`已新建价格 ${id}（初值 0，请改数值；Ctrl+S 保存）`);
 					finish();
-				});
+				}, () => { refreshStatus("已取消新建价格"); finish(); });
 				return this.buildTextPage("正在输入新价格实体 id…", finish);
 			},
 		});
@@ -906,7 +928,7 @@ export class PricingDrawer {
 				refreshStatus(`${priceId} ${label} = ${price(parsed)}（Ctrl+S 保存）`);
 			}
 			done(undefined);
-		});
+		}, () => { refreshStatus("已取消输入"); done(undefined); });
 	}
 
 	/** 管理面：日历注册表（每条日历可删除） */
@@ -952,6 +974,7 @@ export class PricingDrawer {
 					const id = calId.trim();
 					if (id === "") { refreshStatus(theme.fg("error", "日历 id 不能为空")); finish(); return; }
 					if (draft.snapshot().calendars[id]) { refreshStatus(theme.fg("error", `日历已存在: ${id}`)); finish(); return; }
+					// 第二步：日期。此时 draft 尚未写入，取消即整体放弃（不留半创建状态）
 					this.askText(tui, `${id} 的日期（逗号分隔）`, "01-01, 10-01", (rawDates) => {
 						const dates = rawDates.split(/[,，\s]+/).filter(Boolean);
 						if (dates.length === 0) { refreshStatus(theme.fg("error", "至少需要一个日期")); finish(); return; }
@@ -960,8 +983,8 @@ export class PricingDrawer {
 						draft.upsertCalendar(id, { name: id, dates });
 						refreshStatus(`已新建日历 ${id}（${dates.length} 天；Ctrl+S 保存）`);
 						finish();
-					});
-				});
+					}, () => { refreshStatus("已取消新建日历"); finish(); });
+				}, () => { refreshStatus("已取消新建日历"); finish(); });
 				return this.buildTextPage("正在输入新日历信息…", finish);
 			},
 		});
@@ -970,6 +993,13 @@ export class PricingDrawer {
 
 	/**
 	 * 文本输入统一入口：走 ExtensionInputComponent 覆盖层。
+	 *
+	 * 生命周期铁律（漏一半就会"Esc 卡屏"）：
+	 * - 提交走 onSubmit，取消走 onCancel，**两条路径都必须关闭覆盖层**
+	 * - 必须接住 showOverlay 返回的 handle 才能在回调里 hide()
+	 * - 嵌套输入（如日历两步）先关旧的再开新的，避免第一层残留
+	 *
+	 * 取消语义：不写入 draft，仅提示"已取消"并回退（由各调用点传入 onCancel）。
 	 * 无 overlay 能力（单测/降级）时直接同步调用 onSubmit，便于断言。
 	 */
 	private askText(
@@ -977,13 +1007,42 @@ export class PricingDrawer {
 		title: string,
 		placeholder: string,
 		onSubmit: (value: string) => void,
+		onCancel?: () => void,
 	): void {
-		const input = new ExtensionInputComponent(title, placeholder, onSubmit, () => {}, { tui: tui as never });
 		if (typeof tui.showOverlay !== "function") {
 			// 降级：无法弹层，交由调用方决定（这里不阻塞流程）
 			return;
 		}
-		tui.showOverlay(input, { width: 64, anchor: "center" });
+		this.closeOverlay();
+		const input = new ExtensionInputComponent(
+			title,
+			placeholder,
+			(value) => {
+				this.closeOverlay();
+				onSubmit(value);
+			},
+			() => {
+				this.closeOverlay();
+				onCancel?.();
+			},
+			{ tui: tui as never },
+		);
+		const handle = tui.showOverlay(input, { width: 64, anchor: "center" });
+		if (this.overlaySlot) {
+			this.overlaySlot.current = {
+				hide: () => handle?.hide?.(),
+				dispose: () => (input as { dispose?: () => void }).dispose?.(),
+			};
+		}
+	}
+
+	/** 关闭当前输入覆盖层（幂等）；submit / cancel 两条路径与场景互斥守卫共用 */
+	private closeOverlay(): void {
+		const handle = this.overlaySlot?.current;
+		if (!handle) return;
+		this.overlaySlot!.current = null;
+		handle.hide();
+		handle.dispose?.();
 	}
 
 	/** 纯文本页（只读）：Esc 返回 */

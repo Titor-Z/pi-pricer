@@ -100,9 +100,38 @@ Pi 生态的模型计费数据共享中心。解决"厂商调价频繁，硬编�
 （绑定启停、方案操作、价格字段、删除确认、新建输入）改用 `ActionMenu` 自绘菜单
 （↑↓ 选择 / Enter 执行 / Esc 返回），行为可预期。
 
-### 临时页栈（pageStack）
-ActionMenu 之上需要再叠一层只读页（如解析命中链）时，顶层 `handleInput`
-优先派发给栈顶；栈顶页的 Esc 触发 `popPage()` 出栈而非逐级返回。
+### 临时页栈（pageStack）与输入覆盖层（overlay）
+
+两套临时层分工明确、**互斥**：
+
+| 机制 | 用途 | 开关方式 |
+|---|---|---|
+| `pageStack` | 只读页（如解析命中链） | 压栈渲染，Esc 出栈 |
+| `overlay` | 输入层（如新方案 id） | `tui.showOverlay`，Esc 取消 |
+
+- ActionMenu 之上需叠只读页时用 `pageStack`：顶层 `handleInput` 优先派发给栈顶，
+  栈顶 Esc 触发 `popPage()`。
+- overlay 打开期间 `hasOverlay()` 守卫会阻断底层（pageStack / rootList）的输入，
+  避免同一按键双重处理。
+
+### 输入覆盖层生命周期（askText）
+
+**铁律：`onSubmit` 与 `onCancel` 两条路径都必须关闭覆盖层。**
+
+```
+askText(tui, title, placeholder, onSubmit, onCancel?)
+  1. 关闭已有覆盖层（closeOverlay，防嵌套残留）
+  2. new ExtensionInputComponent(title, ph,
+       v => { closeOverlay(); onSubmit(v); },
+       () => { closeOverlay(); onCancel?.(); },
+       { tui })
+  3. 接住 showOverlay 返回的 handle 存入 overlaySlot
+```
+
+- 漏接 handle 或不 hide → 按 Esc 后覆盖层永久残留（用户可见的"卡屏"）
+- 取消语义：**不写入 draft**，仅提示"已取消"并回退一级
+- 嵌套输入（日历两步：id → 日期）：开第二层前先关第一层；第二步取消 = 整体放弃，
+  不留半创建状态（第一步不写入 draft）
 
 ## Interaction
 
@@ -342,4 +371,6 @@ resolvePricing(model, provider, ts)
 - Don't 在 SettingsList 里循环价格值（精确数值不适合离散循环）
 - Don't 让 store/draft 层依赖 ExtensionAPI（纯函数可独立测试）
 - Don't 在格式化层做 JSON 读写（只渲染，不 IO）
+- Don't 给 `ExtensionInputComponent` 传空 `onCancel`（会导致 Esc 卡屏）
+- Don't 丢弃 `showOverlay` 的返回值（拿不到 handle 就无法关闭）
 - Don't 为每个厂商硬编码峰时段逻辑（数据驱动：calendars/plans/rules 定义一切）

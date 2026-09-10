@@ -1411,3 +1411,166 @@ test("v0.6 渲染：状态栏为最后一行且含 Ctrl+S 提示", async () => {
 	assert.ok(statusLine.includes("已保存"), "初始应为已保存态");
 	rmSync(dir, { recursive: true, force: true });
 });
+
+// ── v0.6.1：输入覆盖层生命周期（Esc 可关闭）──────────────────────────────
+
+/** 带 overlay 句柄记录的 mock tui（hideCalls 用于断言覆盖层确实被关闭） */
+function overlayTui() {
+	const state = { overlay: null, hideCalls: 0, overlayCount: 0 };
+	return {
+		state,
+		tui: {
+			showOverlay: (comp) => {
+				state.overlay = comp;
+				state.overlayCount += 1;
+				return { hide: () => { state.hideCalls += 1; } };
+			},
+		},
+	};
+}
+
+/** 在根层向下移动直到当前选中项包含指定文字（返回是否找到） */
+function selectRootItem(handle, plain, label) {
+	for (let i = 0; i < 12; i++) {
+		const row = plain().split("\n").map((l) => l.trim()).find((l) => l.startsWith("→"));
+		if (row && row.includes(label)) return true;
+		handle.handleInput("\u001b[B");
+	}
+	return false;
+}
+
+async function openDrawerWith(path) {
+	const ctx = drawerCtx();
+	await new PricingDrawer(path).open(ctx);
+	const { state, tui } = overlayTui();
+	const handle = ctx.captured.factory(tui, { fg: (c, t) => t, bold: (t) => t }, {}, () => {});
+	const plain = () => handle.render(100).join("\n").replace(/\u001b\[\d+(;\d+)*m/g, "");
+	return { handle, state, plain };
+}
+
+test("v0.6.1 新建日历：Esc 取消 → 覆盖层关闭且不写入", async () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+	const { handle, state, plain } = await openDrawerWith(path);
+
+	assert.ok(selectRootItem(handle, plain, "日历注册表"), "应能在根层找到日历注册表");
+	handle.handleInput("\r");
+	assert.ok(plain().includes("· 日历"), "应进入日历注册表");
+
+	handle.handleInput("\r");  // ＋ 新建日历（首项）
+	assert.equal(state.overlayCount, 1, "应弹出输入覆盖层");
+
+	state.overlay.handleInput("\x1b");   // Esc 取消
+	assert.equal(state.hideCalls, 1, "Esc 后覆盖层必须被关闭（旧版此处为 0 = 卡屏）");
+	assert.ok(plain().includes("已取消"), "应提示已取消");
+	assert.equal(Object.keys(readPricing(path).calendars).length, 1, "取消不得写入新日历");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.6.1 新建日历：第一步取消后不进入第二步", async () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+	const { handle, state, plain } = await openDrawerWith(path);
+
+	assert.ok(selectRootItem(handle, plain, "日历注册表"));
+	handle.handleInput("\r");
+	handle.handleInput("\r");
+	state.overlay.handleInput("\x1b");   // 第一步取消
+	assert.equal(state.overlayCount, 1, "取消第一步不应弹出第二步输入");
+	assert.equal(Object.keys(readPricing(path).calendars).length, 1, "不应创建日历");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.6.1 新建日历：第二步 Esc 取消 → 整体放弃不留半创建", async () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+	const { handle, state, plain } = await openDrawerWith(path);
+
+	assert.ok(selectRootItem(handle, plain, "日历注册表"));
+	handle.handleInput("\r");
+	handle.handleInput("\r");           // 第一步
+	state.overlay.handleInput("my-cal");
+	state.overlay.handleInput("\r");    // 提交 id → 进入第二步
+	assert.equal(state.overlayCount, 2, "应弹出第二步输入");
+
+	state.overlay.handleInput("\x1b");  // 第二步 Esc
+	assert.equal(state.hideCalls, 2, "两层覆盖层都应被关闭");
+	assert.ok(plain().includes("已取消"), "应提示已取消");
+	assert.equal(readPricing(path).calendars["my-cal"], undefined, "第二步取消不得写入");
+	assert.equal(Object.keys(readPricing(path).calendars).length, 1, "日历数不变");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.6.1 新建方案/价格：Esc 取消不写入", async () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+
+	// 方案注册表
+	let d = await openDrawerWith(path);
+	assert.ok(selectRootItem(d.handle, d.plain, "方案注册表"));
+	d.handle.handleInput("\r");
+	d.handle.handleInput("\r");
+	d.state.overlay.handleInput("\x1b");
+	assert.equal(d.state.hideCalls, 1, "方案输入覆盖层应关闭");
+	assert.equal(Object.keys(readPricing(path).plans).length, 3, "取消不得新增方案");
+
+	// 价格注册表
+	d = await openDrawerWith(path);
+	assert.ok(selectRootItem(d.handle, d.plain, "价格注册表"));
+	d.handle.handleInput("\r");
+	d.handle.handleInput("\r");
+	d.state.overlay.handleInput("\x1b");
+	assert.equal(d.state.hideCalls, 1, "价格输入覆盖层应关闭");
+	assert.equal(Object.keys(readPricing(path).prices).length, 3, "取消不得新增价格");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.6.1 价格字段编辑：Esc 取消不改值", async () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+	const { handle, state, plain } = await openDrawerWith(path);
+
+	assert.ok(selectRootItem(handle, plain, "价格注册表"));
+	handle.handleInput("\r");   // 价格注册表
+	handle.handleInput("\r");   // 首个价格实体 → ActionMenu
+	handle.handleInput("\r");   // 改输出价
+	assert.equal(state.overlayCount, 1, "应弹出数值输入");
+	state.overlay.handleInput("\x1b");
+
+	assert.equal(state.hideCalls, 1, "覆盖层应关闭");
+	assert.equal(readPricing(path).prices.peak.output, 8, "取消不得改值");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.6.1 覆盖层打开时底层列表不响应按键", async () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+	const { handle, state, plain } = await openDrawerWith(path);
+
+	const row = () => plain().split("\n").map((l) => l.trim()).find((l) => l.startsWith("→"));
+	assert.ok(selectRootItem(handle, plain, "日历注册表"));
+	handle.handleInput("\r");   // 进入日历注册表
+	const selectedBefore = row();
+	assert.ok(selectedBefore, "注册表应有选中行");
+
+	handle.handleInput("\r");   // ＋ 新建日历 → 打开覆盖层
+	assert.equal(state.overlayCount, 1, "覆盖层应已打开");
+	assert.equal(row(), undefined, "覆盖层展示期间不应再渲染底层选中行");
+
+	// 覆盖层打开期间向抽屉发方向键：底层不得响应（关闭后选中项应保持不变）
+	handle.handleInput("\u001b[B");
+	handle.handleInput("\u001b[B");
+	handle.handleInput("\u001b[B");
+	assert.equal(state.overlayCount, 1, "方向键不应触发新的覆盖层");
+
+	state.overlay.handleInput("\x1b");   // 关闭覆盖层
+	assert.equal(row(), selectedBefore, "覆盖层打开期间的方向键不应移动底层选中项");
+	assert.ok(plain().includes("· 日历"), "应仍停留在日历注册表页");
+	rmSync(dir, { recursive: true, force: true });
+});

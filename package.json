@@ -1,11 +1,23 @@
 {
 	"name": "@foolsecret/pi-pricer",
-	"version": "0.8.0",
+	"version": "0.11.0",
 	"description": "Pi 模型计费配置中心 — 共享价格数据 + 可编辑 UI | Shared model pricing config for Pi extensions",
 	"keywords": [
 		"pi-package",
 		"pi-extension"
 	],
+	"license": "AGPL-3.0-only",
+	"author": "foolsecret <foolsecret@users.noreply.github.com>",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/Titor-Z/pi-pricer.git"
+	},
+	"bugs": {
+		"url": "https://github.com/Titor-Z/pi-pricer/issues"
+	},
+	"publishConfig": {
+		"access": "public"
+	},
 	"type": "module",
 	"main": "./extensions/index.ts",
 	"exports": {
@@ -27,7 +39,8 @@
 	],
 	"scripts": {
 		"typecheck": "tsc --noEmit",
-		"test": "node --test --test-force-exit \"test/**/*.test.mjs\""
+		"test": "node --test --test-force-exit \"test/**/*.test.mjs\"",
+		"prepublishOnly": "npm run typecheck && npm test"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": "*",

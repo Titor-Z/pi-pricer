@@ -1,23 +1,20 @@
 /**
- * /price 命令实现：v2 五注册表浏览 + 绑定管理 + 调试。
+ * /price 命令实现：v2 五注册表浏览 + 管理面 CRUD。
  *
  * 接线层：pi.registerCommand → pricing-ui（抽屉）+ pricing-store +
  * pricing-query + pricing-format。编辑主链路在 TUI 抽屉（draft + Ctrl+S 保存），
- * CLI 提供等价能力（headless 可完整操作）：查询/绑定/move/管理面 CRUD/调试。
+ * CLI 提供等价能力（headless 可完整操作）：查询/管理面 CRUD。
  */
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { seedPricing, updatePricing, readPricing, checkPlanDeletable, checkPriceDeletable } from "./pricing-store.ts";
-import { listProviders } from "./pricing-query.ts";
 import {
 	renderPriceList,
 	renderModelDetail,
-	renderSchema,
 	renderPlanList,
 	renderPlanDetail,
 	renderPriceRegistry,
 	renderCalendarList,
-	renderResolveResult,
 	renderHelp,
 } from "./pricing-format.ts";
 import { PricingDrawer, isValidCalendarDate } from "./pricing-ui.ts";
@@ -63,7 +60,7 @@ export class PricingCommands {
 		seedPricing(this.filePath);
 
 		pi.registerCommand("price", {
-			description: "模型计费（v2 五注册表）：无参开抽屉 | model|scheme|rate|calendar|resolve|bind|unbind|move|schema|list|help",
+			description: "模型计费（v2 五注册表）：无参开抽屉 | model|list|scheme|rate|calendar|help",
 			// pi 只认这个字段生成扩展命令的参数补全（扩展无法设 argumentHint）
 			getArgumentCompletions: (prefix: string) => this.completeArguments(prefix),
 			handler: async (args: string, ctx: ExtensionCommandContext) => {
@@ -77,13 +74,17 @@ export class PricingCommands {
 						ctx.ui.notify(renderPriceList(this.filePath), "info");
 						break;
 					case "list":
+						// TUI 下以 Markdown 总览只读页呈现；headless 回退纯文本
+						if (await this.drawer.open(ctx, "list")) break;
 						ctx.ui.notify(renderPriceList(this.filePath), "info");
 						break;
 					case "help":
+						// TUI 下打开帮助页（InfoPage 排版，可滚动）；headless 回退纯文本
+						if (await this.drawer.open(ctx, "help")) break;
 						ctx.ui.notify(renderHelp(), "info");
 						break;
 					case "model":
-						this.showModel(parts[1], parts[2], ctx);
+						await this.showModel(parts[1], parts[2], ctx);
 						break;
 					case "scheme":
 						// TUI 下直达方案管理页；headless 回退文本
@@ -100,21 +101,6 @@ export class PricingCommands {
 						if (await this.drawer.open(ctx, "calendar")) break;
 						this.calendarOp(parts[1], parts[2], parts[3], parts.slice(4), ctx);
 						break;
-					case "resolve":
-						this.resolve(parts[1], parts[2], parts[3], ctx);
-						break;
-					case "bind":
-						this.bindModel(parts[1], parts[2], parts[3], ctx);
-						break;
-					case "unbind":
-						this.unbindModel(parts[1], parts[2], parts[3], ctx);
-						break;
-					case "move":
-						this.moveBinding(parts[1], parts[2], parts[3], parts[4], ctx);
-						break;
-					case "schema":
-						ctx.ui.notify(renderSchema(), "info");
-						break;
 					default:
 						ctx.ui.notify(renderHelp(), "info");
 				}
@@ -127,8 +113,8 @@ export class PricingCommands {
 	 *
 	 * 分层规则：按已输入的 token 数决定补哪一层
 	 * - 第 1 个 token → 一级子命令
-	 * - 第 2 个 token → 二级动作（scheme/rate/calendar/move）
-	 * - 第 3+ 个 token → 动态 id（provider/model/plan/id/field/value）
+	 * - 第 2 个 token → 二级动作（scheme/rate/calendar）
+	 * - 第 3+ 个 token → 动态 id（provider/model/id/field/value）
 	 *
 	 * 任何异常都吞掉并降级为静态候选：补全抛错会破坏输入框体验。
 	 */
@@ -166,8 +152,8 @@ export class PricingCommands {
 		const spec = findSubcommand(settled[0]);
 		if (!spec) return null;
 
-		// 判断是否已输入二级动作（scheme create / rate set / ...；move 的方向也是 action）
-		const action = spec.children?.find((c) => c.name === settled[1]);
+// 判断是否已输入二级动作（scheme create / rate set / calendar add）
+			const action = spec.children?.find((c) => c.name === settled[1]);
 		// 位置参数语义表：有 action 用 action 的，否则用子命令自身的
 		const positionals = action ? (action.args ?? []) : (spec.args ?? []);
 		// 已消费的位置参数个数（减去子命令名，以及已输入的动作名）
@@ -205,32 +191,12 @@ export class PricingCommands {
 				const items = scoped ? scoped.map((m) => ({ value: m, description: `${consumed[0]}/${m}` })) : all;
 				return this.toItems(items, prefix);
 			}
-			case "plan": {
-				// 优先列该模型已绑定的方案；无绑定信息时列出全部方案
-				const [provId, modelId] = consumed;
-				const bound = provId && modelId ? (schema.providers[provId]?.models[modelId]?.plans ?? []) : [];
-				if (bound.length > 0) {
-					return this.toItems(
-						bound.map((b) => ({ value: b.plan, description: schema.plans[b.plan]?.name ?? "已绑定" })),
-						prefix,
-					);
-				}
-				return this.toItems(
-					Object.entries(schema.plans).map(([id, pl]) => ({ value: id, description: pl.name })),
-					prefix,
-				);
-			}
-			case "direction":
-				return this.toItems(
-					(findSubcommand(name)?.children ?? []).map((c) => ({ value: c.name, description: c.summary })),
-					prefix,
-				);
 			case "field":
 				return this.toItems(PRICE_FIELDS.map((f) => ({ value: f })), prefix);
 			case "id":
 				return this.toItems(this.registryIds(name, schema), prefix);
 			default:
-				// 无位置参数语义的子命令（list/schema/help）不补
+				// 无位置参数语义的子命令（list/help）不补
 				return null;
 		}
 	}
@@ -263,11 +229,13 @@ export class PricingCommands {
 		}));
 	}
 
-	private showModel(provider: string | undefined, model: string | undefined, ctx: ExtensionCommandContext): void {
+	private async showModel(provider: string | undefined, model: string | undefined, ctx: ExtensionCommandContext): Promise<void> {
 		if (!provider || !model) {
 			ctx.ui.notify("用法: /price model <provider> <model>", "info");
 			return;
 		}
+		// TUI 下以 Markdown 详情只读页呈现（InfoPage）；headless 回退纯文本
+		if (await this.drawer.open(ctx, "model", { provider, model })) return;
 		ctx.ui.notify(renderModelDetail(provider, model, this.filePath), "info");
 	}
 
@@ -425,56 +393,6 @@ export class PricingCommands {
 		ctx.ui.notify(`已删除日历 ${calId}`, "info");
 	}
 
-	/**
-	 * /price move <provider> <model> <plan-id> <up|down|top|bottom>
-	 * 绑定数组顺序 = 优先级（first match wins）；TUI 不做重排序（SettingsList 无选中索引），
-	 * 因此排序能力由 CLI 承担。越界时为空操作并提示，不产生破坏性变更。
-	 */
-	private moveBinding(provider: string | undefined, model: string | undefined, plan: string | undefined, direction: string | undefined, ctx: ExtensionCommandContext): void {
-		if (!provider || !model || !plan || !direction) {
-			ctx.ui.notify("用法: /price move <provider> <model> <plan-id> <up|down|top|bottom>", "info");
-			return;
-		}
-		const dir = direction;
-		if (!["up", "down", "top", "bottom"].includes(dir)) {
-			ctx.ui.notify(`无效方向: ${direction}（可用 up / down / top / bottom）`, "info");
-			return;
-		}
-		let note = "";
-		try {
-			updatePricing((data) => {
-				const conf = data.providers[provider!]?.models[model!];
-				if (!conf) throw new Error(`未找到模型: ${provider}/${model}`);
-				const i = conf.plans.findIndex((b) => b.plan === plan);
-				if (i < 0) throw new Error(`该模型未绑定方案: ${plan}`);
-				// 目标下标；越界则夹紧到边界（等价于无操作，但在两端给提示）
-				const target = this.resolveMoveTarget(i, conf.plans.length, dir);
-				if (target === i) {
-					note = `（已在${i === 0 ? "最高" : "最低"}优先级，未移动）`;
-					return data;
-				}
-				const [moved] = conf.plans.splice(i, 1);
-				conf.plans.splice(target, 0, moved);
-				note = "";
-				return data;
-			}, this.filePath);
-		} catch (err) {
-			ctx.ui.notify(`移动失败: ${(err as Error).message}`, "info");
-			return;
-		}
-		ctx.ui.notify(`已移动 ${provider}/${model} 的绑定 ${plan} ${dir}${note}（/price model ${provider} ${model} 查看新顺序）`, "info");
-	}
-
-	/** 计算移动后的目标下标（up/down 逐位，top/bottom 到端点） */
-	private resolveMoveTarget(index: number, length: number, direction: string): number {
-		switch (direction) {
-			case "up": return Math.max(0, index - 1);
-			case "down": return Math.min(length - 1, index + 1);
-			case "top": return 0;
-			default: return length - 1;
-		}
-	}
-
 	private priceOp(op: string | undefined, id: string | undefined, field: string | undefined, value: string | undefined, ctx: ExtensionCommandContext): void {
 		switch (op) {
 			case "set":
@@ -557,63 +475,5 @@ export class PricingCommands {
 			return;
 		}
 		ctx.ui.notify(`已删除价格实体 ${priceId}`, "info");
-	}
-
-	private resolve(model: string | undefined, provider: string | undefined, ts: string | undefined, ctx: ExtensionCommandContext): void {
-		if (!model) {
-			ctx.ui.notify("用法: /price resolve <model> [provider] [YYYY-MM-DDTHH:mm]\n  例: /price resolve deepseek-flash deepseek 2026-09-16T10:00", "info");
-			return;
-		}
-		const providers = listProviders(this.filePath);
-		const prov = provider ?? providers[0] ?? "deepseek";
-		let date: Date | undefined;
-		if (ts) {
-			date = new Date(ts.includes("T") ? ts : `${ts}T12:00:00`);
-			if (Number.isNaN(date.getTime())) date = undefined;
-		}
-		ctx.ui.notify(renderResolveResult(model, prov, date, this.filePath), "info");
-	}
-
-	private bindModel(provider: string | undefined, model: string | undefined, plan: string | undefined, ctx: ExtensionCommandContext): void {
-		if (!provider || !model || !plan) {
-			ctx.ui.notify("用法: /price bind <provider> <model> <plan-id>", "info");
-			return;
-		}
-		try {
-			updatePricing((data) => {
-				const conf = data.providers[provider!]?.models[model!];
-				if (!conf) throw new Error(`未找到模型: ${provider}/${model}`);
-				if (!data.plans[plan!]) throw new Error(`未找到方案: ${plan}`);
-				const existing = conf.plans.find((b) => b.plan === plan!);
-				if (existing) existing.enabled = true;
-				else conf.plans.push({ plan: plan!, enabled: true });
-				return data;
-			}, this.filePath);
-		} catch (err) {
-			ctx.ui.notify(`绑定失败: ${(err as Error).message}`, "info");
-			return;
-		}
-		ctx.ui.notify(`已绑定 ${provider}/${model} → ${plan}（排最后=最低优先级；/price model 查看）`, "info");
-	}
-
-	private unbindModel(provider: string | undefined, model: string | undefined, plan: string | undefined, ctx: ExtensionCommandContext): void {
-		if (!provider || !model || !plan) {
-			ctx.ui.notify("用法: /price unbind <provider> <model> <plan-id>", "info");
-			return;
-		}
-		try {
-			updatePricing((data) => {
-				const conf = data.providers[provider!]?.models[model!];
-				if (!conf) throw new Error(`未找到模型: ${provider}/${model}`);
-				const before = conf.plans.length;
-				conf.plans = conf.plans.filter((b) => b.plan !== plan!);
-				if (conf.plans.length === before) throw new Error(`该模型未绑定方案: ${plan}`);
-				return data;
-			}, this.filePath);
-		} catch (err) {
-			ctx.ui.notify(`解除失败: ${(err as Error).message}`, "info");
-			return;
-		}
-		ctx.ui.notify(`已解除 ${provider}/${model} → ${plan}`, "info");
 	}
 }

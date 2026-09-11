@@ -102,9 +102,9 @@ Pi 生态的模型计费数据共享中心。解决"厂商调价频繁，硬编�
 ### Model Detail（Level 2，可编辑菜单）
 - SettingsList 菜单页，逐项带 `submenu`：
   - 每条绑定一行：`#N ◉/◌ <方案名>`（`#N` = 优先级序号，首个标 `← 先匹配`），
-    说明栏列出该方案规则时段 + "排序用 /price move"
+    说明栏列出该方案规则时段 + "绑定重排入口规划中"
   - `＋ 绑定新方案`（仅在存在未绑定方案时显示）
-  - `别名（台账匹配）` → ExtensionInputComponent 覆盖层输入
+  - `别名（台账匹配）` → askText 输入弹窗（PromptOverlay，并入重排规划）
   - `解析调试（预演某时刻命中链）` → ActionMenu（`此刻` / `指定时间…`）
     → 只读命中链页（`renderResolveResult`）
   - `查看只读详情` → 只读文本页（`renderModelDetail`）
@@ -170,6 +170,37 @@ Pi 生态的模型计费数据共享中心。解决"厂商调价频繁，硬编�
 
 > 设计意图：用户**不用记 id**，也不用离开输入框查看配置；每一行都能自证含义。
 
+### 结构化说明信息排版（InfoPage + Markdown 渲染）
+
+> 适用对象：`/price help`、`/price schema`、解析命中链（resolve）、模型详情等
+> "一次性读完的只读说明页"。**瞬时状态反馈**（如「正在输入…」占位页）不在此列。
+
+**headless 与 TUI 双轨**：
+
+| 场景 | help / schema | list / 模型详情 / resolve | 瞬时占位 |
+|---|---|---|---|
+| headless | `renderHelp()` / `renderSchema()` 纯文本 notify | `renderPriceList()` / `renderModelDetail()` / `renderResolveResult()` | 纯文本 |
+| TUI | `renderHelpMarkdown()` / `renderSchemaMarkdown()` → InfoPage | `renderPriceListMarkdown()` / `renderModelDetailMarkdown()` / `renderResolveResultMarkdown()` → InfoPage | `buildTextPage` 文本 |
+
+- 纯文本版与 Markdown 版**内容同源**（help 两版都从 `PRICE_SUBCOMMANDS` 派生），
+  避免"markdown 符号泄进通知面板"或两处内容漂移
+- help/schema/list/model/resolve 在 TUI 下走 `drawer.open(ctx, page, opts)` 直达
+  InfoPage 只读页，`depth=1` → Esc 一次关闭；model/resolve 通过 `InfoPageOptions`
+  （provider / model / ts）参数化内容，与抽屉内部页同源同排版
+
+**InfoPage 滚动窗口**（`src/pricing-info-page.ts`）：
+
+- `render(width)` 固定输出 `MAX_INFO_LINES=16` 内容行 + 底部 dim 提示条
+  （`↑↓ 滚动 · PgUp/PgDn 翻页 · Esc 返回`）
+- 组件**自管 `scrollTop`**（Home/End 顶底、PgUp/PgDn 翻页、↑↓ 逐行），
+  不依赖 ScrollView；Esc 走调用方传入的 `goBack`
+- 设计依据：裸 `Container` 的 `render()` 只知道宽度，不知道外层剩余高度；
+  与其猜测视口高度，不如"固定行数上限 + 自管滚动"（SettingsList 同款思路），零布局侵入
+
+**Markdown 主题**（`buildMarkdownTheme`）：直接映射 pi 主题的语义色
+`mdHeading` / `mdLink` / `mdCode` / `mdCodeBlock` / `mdQuote` / `mdListBullet`，
+不自定义 hex。
+
 ### 临时页栈（pageStack）与输入覆盖层（overlay）
 
 两套临时层分工明确、**互斥**：
@@ -184,17 +215,43 @@ Pi 生态的模型计费数据共享中心。解决"厂商调价频繁，硬编�
 - overlay 打开期间 `hasOverlay()` 守卫会阻断底层（pageStack / rootList）的输入，
   避免同一按键双重处理。
 
+### 输入与帮助信息（PromptOverlay + 「注」脚注）
+
+所有输入弹窗统一为自建 `PromptOverlay`（src/pricing-prompt.ts）。官方
+`ExtensionInputComponent` 在 Esc 后 handleInput 存在 1ms 竞态休眠，被本组件替换。
+
+布局（自绘 Container，v0.11）：
+
+```
+────────────────────────
+ <标题（accent）>          ← buildMarkdownTheme().heading / accent
+ ────────────────────────
+ 输入行（Input 就地编辑）
+
+   ✗ <错误行（error 色）>    ← 仅提交校验失败时出现，紧贴输入框
+   注：<格式脚注（dim）>     ← notes，提示填写格式/单位/约定
+ submit · cancel            ← keyHint 页脚（英文）
+────────────────────────
+```
+
+- **校验内联化**：Enter 提交时走 `validate(raw)`，失败弹窗**不关**、输入不丢，
+  错误行随每次输入或 Esc 清除；替代旧"关窗重开 + 错误标题"模式。
+- **「注：」前缀只在渲染层加**（PromptOverlay / openTextEditor / withRootNotes /
+  InfoPage），调用方只传正文，避免"注：注："重复前缀。
+- **预填现值**：`initialValue` 预填当前值（改名弹窗预填旧名、价格编辑器预填现值），
+  提交时校验通过才 onCommit。
+- 9 处调用点统一为 `askText(tui, theme, { title, notes, placeholder, initialValue,
+  validate, onSubmit, onCancel })`；仍走 `showOverlay` + 收下 handle。
+
 ### 输入覆盖层生命周期（askText）
 
 **铁律：`onSubmit` 与 `onCancel` 两条路径都必须关闭覆盖层。**
 
 ```
-askText(tui, title, placeholder, onSubmit, onCancel?)
+askText(tui, theme, { title, notes?, placeholder?, initialValue?, validate?,
+                      onSubmit, onCancel? })
   1. 关闭已有覆盖层（closeOverlay，防嵌套残留）
-  2. new ExtensionInputComponent(title, ph,
-       v => { closeOverlay(); onSubmit(v); },
-       () => { closeOverlay(); onCancel?.(); },
-       { tui })
+  2. new PromptOverlay(options)   // 内部 Input 实时编辑，提交时 validate
   3. 接住 showOverlay 返回的 handle 存入 overlaySlot
 ```
 
@@ -202,6 +259,17 @@ askText(tui, title, placeholder, onSubmit, onCancel?)
 - 取消语义：**不写入 draft**，仅提示"已取消"并回退一级
 - 嵌套输入（日历两步：id → 日期）：开第二层前先关第一层；第二步取消 = 整体放弃，
   不留半创建状态（第一步不写入 draft）
+- 提交校验失败不 hide：错误行内联显示，继续输入或 Esc 清除
+
+### 页面级「注：」脚注
+
+- 四个根页（models / scheme / rate / calendar）用 `withRootNotes(list, notes)`
+  包一层：SettingsList 自身不暴露 footer，包装组件在渲染尾部追加 dim 脚注行
+  （Container 不转发 handleInput → 用普通 Component 透传 render/handleInput/
+  invalidate，不能直接包 Container）。
+- 模型详情只读页（InfoPage）构造参数 `notes` 追加绑定优先级说明。
+- 根页内容：models = 绑定顺序即优先级 + 重排入口规划中；
+  scheme/rate = 命名沿革；calendar = 日期格式约定。
 
 ## Interaction
 
@@ -210,17 +278,16 @@ askText(tui, title, placeholder, onSubmit, onCancel?)
 | 命令 | 交互 | 用途 |
 |---|---|---|
 | `/price` | 无参 → 三级抽屉（TUI）/ list 文本（headless） | 默认浏览 + 编辑 |
-| `/price list` | 文本输出 | 快速查看 |
-| `/price model <p> <m>` | 文本详情 | 查看单模型 |
+| `/price list` | 文本/Markdown 只读页 | 总览 |
+| `/price model <p> <m>` | 文本/Markdown 只读页 | 查看单模型 |
 | `/price scheme [<id>]` | TUI 直达方案管理页 / 文本列表 | 方案管理 |
-| `/price scheme create\|duplicate\|delete` | 命令行 | 方案 CRUD（headless 可用） |
-| `/price rate [create\|set\|delete]` | 命令行 | 价格实体 CRUD |
-| `/price calendar [add\|remove]` | 命令行 | 日历 CRUD |
-| `/price bind <p> <m> <plan>` | 命令行 | 追加绑定（末尾=最低优先级） |
-| `/price unbind <p> <m> <plan>` | 命令行 | 移除绑定 |
-| `/price move <p> <m> <plan> <up\|down\|top\|bottom>` | 命令行 | **调整绑定优先级** |
-| `/price resolve <m> [p] [ts]` | 文本命中链 | 调试 first-match |
-| `/price schema` | 文本 schema 说明 | 手动编辑参考 |
+| `/price rate [<id>]` | TUI 直达价格管理页 / 文本列表 | 价格管理 |
+| `/price calendar [<id>]` | TUI 直达日历管理页 / 文本列表 | 日历管理 |
+| `/price help` | 帮助（TUI 下为可滚动 Markdown 说明页） | 快速参考 |
+
+> v0.10 起 CLI **不再暴露编辑命令**（bind/unbind/move/resolve/schema 已移除）：
+> 所有编辑（改数值/改名/绑定启停/规则 schedule）都在 TUI 抽屉内完成，
+> headless 仅保留只读命令。绑定重排入口暂未提供（规划中）。
 
 ### 键盘映射
 
@@ -237,6 +304,10 @@ askText(tui, title, placeholder, onSubmit, onCancel?)
 
 > `Ctrl+Z` 未采用：终端默认将其作为 SIGTSTP（挂起进程），不适合做撤销。
 > 这些键在根层拦截（SettingsList 子菜单展开时会接管全部输入，详见 AGENTS.md 认知修正 6）。
+> 按键检测用 pi-tui `matchesKey("ctrl+s")` 而非裸字节：增强键盘协议（Kitty /
+> modifyOtherKeys）下终端把 Ctrl+S 编码为 CSI-u / modifyOtherKeys 序列
+> （详见 AGENTS.md 认知修正 34）。保存后状态栏区分成功（"保存成功：已写入
+> ~/.pi/model-pricing.json"）与失败（红字"保存失败：<原因>"）。
 
 ### 草稿生命周期（PricingDraft）
 
@@ -260,8 +331,9 @@ Ctrl+R → reset() 重新 readPricing，清空 changed
 ### 排序为何不在 TUI
 
 绑定数组顺序即优先级，但 **TUI 抽屉不提供上下移**：`SettingsList` 不暴露
-`selectedIndex` 且子菜单会接管输入，自建可重排列表成本高。排序由 CLI
-`/price move` 承担，抽屉内绑定顺序以 `#N` 序号**只读展示**并在说明栏提示命令。
+`selectedIndex` 且子菜单会接管输入，自建可重排列表成本高。v0.10 移除了 CLI
+`/price move`，绑定重排入口**暂未提供（规划中）**；抽屉内绑定顺序以 `#N` 序号
+**只读展示**，models 根页脚注注明"绑定数组顺序即优先级，首个命中生效"。
 
 ### 预演调试（为何需要 pageStack）
 
@@ -296,8 +368,10 @@ pi 为扩展命令生成候选**只读 `getArgumentCompletions`**；扩展无法
 
 ### 无 TUI 回退
 
-headless 模式下 `/price` 回退为 `list` 文本输出；所有编辑能力均有等价 CLI
-（bind / unbind / move / plan / price / calendar），headless 可完整操作。
+headless 模式下 `/price` 回退为 `list` 文本输出；`/price list` / `model` /
+`scheme` / `rate` / `calendar` / `help` 在 headless 仍输出纯文本。
+TUI 下可完成所有编辑（改数值/改名/绑定启停/规则 schedule），
+headless 仅保留只读命令。
 
 ## Data Schema（JSON v1）
 
@@ -463,7 +537,7 @@ resolvePricing(model, provider, ts)
 - Do 新增子命令时同步 `pricing-cli-spec.ts`（单一数据源），补全/help/dispatch 自动跟进
 - Do "首次提示、再次确认"的守卫（如 Esc 退出）必须带已提示状态位
 - Do 每个 submenu 的关闭路径统一走一个 `finish()`，避免双重关闭
-- Do 让 `/price list` 在 headless 模式下回退为文本输出，且每个编辑能力都有 CLI 等价命令
+- Do 让 `/price list` 在 headless 模式下回退为文本输出；TUI 下 list/model/scheme/rate/calendar/help 均走 InfoPage 只读页
 - Don't 用 SettingsList 做"执行动作"（普通项 Enter 是空操作）——用 `submenu` 或 ActionMenu
 - Don't 在抽屉子菜单内期待顶层快捷键生效（子菜单会接管输入）
 - Don't 在 SettingsList 里循环价格值（精确数值不适合离散循环）
@@ -471,6 +545,6 @@ resolvePricing(model, provider, ts)
 - Don't 在格式化层做 JSON 读写（只渲染，不 IO）
 - Don't 自绘补全菜单：渲染归 pi-tui（`Editor` + `SelectList`），本项目只提供候选数据
 - Don't 在补全回调里做重 IO 或抛错（异常必须降级为静态候选/null）
-- Don't 给 `ExtensionInputComponent` 传空 `onCancel`（会导致 Esc 卡屏）
+- Don't 给输入弹窗传空 `onCancel`（会导致 Esc 卡屏）——必须接 handle 且 onSubmit/onCancel 都 hide+dispose
 - Don't 丢弃 `showOverlay` 的返回值（拿不到 handle 就无法关闭）
 - Don't 为每个厂商硬编码峰时段逻辑（数据驱动：calendars/plans/rules 定义一切）

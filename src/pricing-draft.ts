@@ -15,6 +15,7 @@ import type {
 	PricingRule,
 	PricingSchema,
 	PriceEntity,
+	Schedule,
 } from "./pricing-types.ts";
 
 /** 保存结果：ok=false 时 reason 说明拒绝原因（不落盘） */
@@ -112,6 +113,32 @@ export class PricingDraft {
 		return true;
 	}
 
+	/** 调整绑定优先级（数组顺序 = 优先级；首元素最先匹配） */
+	moveBinding(provider: string, model: string, planId: string, dir: "up" | "down" | "top" | "bottom"): boolean {
+		const conf = this.data.providers[provider]?.models[model];
+		if (!conf) return false;
+		const list = conf.plans;
+		const index = list.findIndex((b) => b.plan === planId);
+		if (index < 0) return false;
+		const [binding] = list.splice(index, 1);
+		switch (dir) {
+			case "up":
+				list.splice(Math.max(0, index - 1), 0, binding);
+				break;
+			case "down":
+				list.splice(Math.min(list.length, index + 1), 0, binding);
+				break;
+			case "top":
+				list.unshift(binding);
+				break;
+			case "bottom":
+				list.push(binding);
+				break;
+		}
+		this.mark("模型");
+		return true;
+	}
+
 	// ── 价格实体 ──────────────────────────────────────────────────────────
 
 	/** 修改价格实体字段（input.miss / input.hit / output） */
@@ -123,6 +150,15 @@ export class PricingDraft {
 			case "input.hit": p.input.hit = value; break;
 			case "output": p.output = value; break;
 		}
+		this.mark("价格");
+		return true;
+	}
+
+	/** 修改价格实体显示名（空字符串 = 回退为 id） */
+	setPriceName(priceId: string, name: string): boolean {
+		const p = this.data.prices[priceId];
+		if (!p) return false;
+		p.name = name.trim() === "" ? priceId : name.trim();
 		this.mark("价格");
 		return true;
 	}
@@ -149,6 +185,15 @@ export class PricingDraft {
 	upsertPlan(planId: string, plan: PricingPlan): boolean {
 		if (!planId) return false;
 		this.data.plans[planId] = plan;
+		this.mark("方案");
+		return true;
+	}
+
+	/** 修改方案显示名（空字符串 = 回退为 id） */
+	setPlanName(planId: string, name: string): boolean {
+		const plan = this.data.plans[planId];
+		if (!plan) return false;
+		plan.name = name.trim() === "" ? planId : name.trim();
 		this.mark("方案");
 		return true;
 	}
@@ -195,6 +240,63 @@ export class PricingDraft {
 		return true;
 	}
 
+	/** 设置规则生效星期（空数组 = 任意星期）；同步清理日程字段，避免语义打架 */
+	private setRuleSchedule(planId: string, ruleIndex: number, mutate: (s: Schedule) => void): boolean {
+		const rule = this.data.plans[planId]?.rules[ruleIndex];
+		if (!rule) return false;
+		mutate(rule.schedule);
+		this.mark("方案");
+		return true;
+	}
+
+	/** 设置规则生效星期（1=周一 ... 7=周日；空数组 = 任意星期） */
+	setScheduleWeekdays(planId: string, ruleIndex: number, weekdays: number[]): boolean {
+		return this.setRuleSchedule(planId, ruleIndex, (s) => {
+			s.weekdays = [...weekdays];
+		});
+	}
+
+	/** 设置规则生效时段（[{start,end}…] 半开区间；空数组 = 全天） */
+	setScheduleRanges(planId: string, ruleIndex: number, ranges: [string, string][]): boolean {
+		return this.setRuleSchedule(planId, ruleIndex, (s) => {
+			s.ranges = JSON.parse(JSON.stringify(ranges)) as [string, string][];
+		});
+	}
+
+	/** 设置规则引用的日历 + 模式（calendar=undefined 或 mode=undefined 时清除日历引用） */
+	setScheduleCalendar(planId: string, ruleIndex: number, calendar: string | undefined, mode: "include" | "exclude" | undefined): boolean {
+		return this.setRuleSchedule(planId, ruleIndex, (s) => {
+			if (!calendar || !mode) {
+				delete s.calendar;
+				delete s.calendarMode;
+			} else {
+				s.calendar = calendar;
+				s.calendarMode = mode;
+			}
+		});
+	}
+
+	/** 设置规则指定日期（空数组 = 清除） */
+	setScheduleIncludeDates(planId: string, ruleIndex: number, dates: string[]): boolean {
+		return this.setRuleSchedule(planId, ruleIndex, (s) => {
+			s.includeDates = dates;
+		});
+	}
+
+	/** 设置规则排除日期（空数组 = 清除） */
+	setScheduleExcludeDates(planId: string, ruleIndex: number, dates: string[]): boolean {
+		return this.setRuleSchedule(planId, ruleIndex, (s) => {
+			s.excludeDates = dates;
+		});
+	}
+
+	/** 设置规则时区（IANA 名） */
+	setScheduleTimezone(planId: string, ruleIndex: number, timezone: string): boolean {
+		return this.setRuleSchedule(planId, ruleIndex, (s) => {
+			s.timezone = timezone.trim();
+		});
+	}
+
 	/** 追加规则（复制最后一条的形状，避免用户从零填 schedule） */
 	addRule(planId: string): boolean {
 		const plan = this.data.plans[planId];
@@ -231,6 +333,48 @@ export class PricingDraft {
 	deleteCalendar(calId: string): boolean {
 		if (!this.data.calendars[calId]) return false;
 		delete this.data.calendars[calId];
+		this.mark("日历");
+		return true;
+	}
+
+	/** 修改日历显示名（空字符串 = 回退为 id） */
+	setCalendarName(calId: string, name: string): boolean {
+		const cal = this.data.calendars[calId];
+		if (!cal) return false;
+		cal.name = name.trim() === "" ? calId : name.trim();
+		this.mark("日历");
+		return true;
+	}
+
+	/** 追加若干日期到日历（去重保序） */
+	addCalendarDates(calId: string, dates: string[]): boolean {
+		const cal = this.data.calendars[calId];
+		if (!cal) return false;
+		const seen = new Set(cal.dates);
+		for (const d of dates) {
+			if (!seen.has(d)) seen.add(d);
+		}
+		cal.dates = [...seen];
+		this.mark("日历");
+		return true;
+	}
+
+	/** 覆盖日历的日期全集（按 mm-dd 去重保序） */
+	setCalendarDates(calId: string, dates: string[]): boolean {
+		const cal = this.data.calendars[calId];
+		if (!cal) return false;
+		cal.dates = [...new Set(dates)];
+		this.mark("日历");
+		return true;
+	}
+
+	/** 删除日历中的某个日期 */
+	removeCalendarDate(calId: string, date: string): boolean {
+		const cal = this.data.calendars[calId];
+		if (!cal) return false;
+		const next = cal.dates.filter((d) => d !== date);
+		if (next.length === cal.dates.length) return false;
+		cal.dates = next;
 		this.mark("日历");
 		return true;
 	}

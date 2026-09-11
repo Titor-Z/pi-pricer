@@ -46,7 +46,7 @@ export const GROUP_ORDER: SubcommandGroup[] = ["models", "manage", "debug"];
 /**
  * 全部一级子命令（命令面的唯一真相）。
  * args 里的语义名与补全逻辑（pricing-commands）约定一致：
- * provider / model / plan / price / calendar / ts / direction 是有动态来源的列。
+ * provider / model / plan / price / calendar / field 是有动态来源的列。
  */
 export const PRICE_SUBCOMMANDS: SubcommandSpec[] = [
 	{
@@ -59,30 +59,6 @@ export const PRICE_SUBCOMMANDS: SubcommandSpec[] = [
 		name: "list",
 		summary: "模型计费总览（文本表格）",
 		group: "models",
-	},
-	{
-		name: "bind",
-		summary: "为模型追加方案绑定（末尾 = 最低优先级）",
-		group: "models",
-		args: ["provider", "model", "plan"],
-	},
-	{
-		name: "unbind",
-		summary: "移除模型绑定",
-		group: "models",
-		args: ["provider", "model", "plan"],
-	},
-	{
-		name: "move",
-		summary: "调整绑定优先级（数组顺序 = 优先级）",
-		group: "models",
-		args: ["provider", "model", "plan", "direction"],
-		children: [
-			{ name: "up", summary: "上移一位" },
-			{ name: "down", summary: "下移一位" },
-			{ name: "top", summary: "移到最高优先级" },
-			{ name: "bottom", summary: "移到最低优先级" },
-		],
 	},
 	{
 		name: "scheme",
@@ -114,19 +90,8 @@ export const PRICE_SUBCOMMANDS: SubcommandSpec[] = [
 		],
 	},
 	{
-		name: "resolve",
-		summary: "调试命中链（可指定时间）",
-		group: "debug",
-		args: ["model", "provider", "ts"],
-	},
-	{
-		name: "schema",
-		summary: "v2 结构说明",
-		group: "debug",
-	},
-	{
 		name: "help",
-		summary: "显示本帮助",
+		summary: "显示本帮助（含 schema 说明）",
 		group: "debug",
 	},
 ];

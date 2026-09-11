@@ -24,9 +24,12 @@ const { resolvePricing, createPricingResolver, resolveDebug, listProviderModels,
 const {
 	renderPriceList, renderModelDetail, renderSchema, renderPlanList, renderPlanDetail,
 	renderPriceRegistry, renderCalendarList, renderResolveResult, renderHelp,
+	renderHelpMarkdown, renderSchemaMarkdown, renderResolveResultMarkdown, renderModelDetailMarkdown,
+	renderPriceListMarkdown,
 } = await jiti.import(`${SRC}/pricing-format.ts`);
 const { listProviderRows, listModelRows } = await jiti.import(`${SRC}/pricing-builder.ts`);
 const { PricingDrawer } = await jiti.import(`${SRC}/pricing-ui.ts`);
+const { InfoPage, MAX_INFO_LINES } = await jiti.import(`${SRC}/pricing-info-page.ts`);
 const { PricingCommands } = await jiti.import(`${SRC}/pricing-commands.ts`);
 
 function tmpDir() {
@@ -485,11 +488,19 @@ test("format：renderResolveResult 命中链与兜底链", () => {
 	rmSync(dir, { recursive: true, force: true });
 });
 
-test("format：renderHelp 含主要子命令", () => {
+test("format：renderHelp 含主要子命令，不含已删命令", () => {
 	const t = renderHelp();
-	assert.ok(t.includes("/price resolve"));
 	assert.ok(t.includes("/price scheme"));
-	assert.ok(t.includes("/price bind"));
+	assert.ok(t.includes("/price rate"));
+	assert.ok(t.includes("/price calendar"));
+	assert.ok(t.includes("/price model"));
+	assert.ok(t.includes("/price list"));
+	assert.ok(t.includes("/price help"));
+	assert.ok(!t.includes("/price bind"), "bind 已移除");
+	assert.ok(!t.includes("/price unbind"), "unbind 已移除");
+	assert.ok(!t.includes("/price move"), "move 已移除");
+	assert.ok(!t.includes("/price resolve"), "resolve 已移除");
+	assert.ok(!t.includes("/price schema"), "schema 已移除");
 });
 
 // ── builder 纯函数 ──────────────────────────────────────────────────────
@@ -644,33 +655,6 @@ test("挂载：/price 无参 TUI 开抽屉（渲染厂商列表）；headless �
 	rmSync(dir, { recursive: true, force: true });
 });
 
-test("挂载：/price bind 追加末尾（最低优先级）→ 绑定数+1 / 谷仍生效；unbind 回退", async () => {
-	const dir = tmpDir();
-	const path = join(dir, "pricing.json");
-	const f = structuredClone(FIXTURE);
-	// deepseek-flash 只绑谷价
-	f.providers.deepseek.models["deepseek-flash"].plans = [{ plan: "valleyalways", enabled: true }];
-	writePricing(f, path);
-	const { handler } = mountAt(path);
-	const ctx = cmdCtx({ withCustom: false });
-	ctx.ui = { notify: ctx.ui.notify };
-	const modelPlans = () => listProviderModels("deepseek", undefined, path)[0].planBindings.length;
-
-	assert.equal(modelPlans(), 1);
-	assert.equal(resolvePricing("deepseek-flash", "deepseek", PEAK_TS, path).output, 4);
-	await handler("bind deepseek deepseek-flash peakworkday", ctx);
-	assert.ok(ctx.notifications.at(-1).includes("已绑定"));
-	assert.equal(modelPlans(), 2, "bind 追加绑定");
-	assert.equal(resolvePricing("deepseek-flash", "deepseek", PEAK_TS, path).output, 4, "追加在末尾=最低优先级，谷 always 仍 first-match");
-
-	ctx.notifications.length = 0;
-	await handler("unbind deepseek deepseek-flash peakworkday", ctx);
-	assert.ok(ctx.notifications.at(-1).includes("已解除"));
-	assert.equal(modelPlans(), 1, "unbind 移除绑定");
-	assert.equal(resolvePricing("deepseek-flash", "deepseek", PEAK_TS, path).output, 4);
-	rmSync(dir, { recursive: true, force: true });
-});
-
 test("挂载：/price rate set 修改实体 → resolve 反映；删除被引用价格被拒", async () => {
 	const dir = tmpDir();
 	const path = join(dir, "pricing.json");
@@ -689,24 +673,20 @@ test("挂载：/price rate set 修改实体 → resolve 反映；删除被引用
 	rmSync(dir, { recursive: true, force: true });
 });
 
-test("挂载：/price resolve 输出命中链；/price scheme 输出方案列表", async () => {
+test("挂载：/price scheme headless 输出方案列表；未知子命令给 help", async () => {
 	const dir = tmpDir();
 	const path = writeFixture(dir);
 	const { handler } = mountAt(path);
 	const ctx = cmdCtx({ withCustom: false });
 	ctx.ui = { notify: ctx.ui.notify };
 
-	await handler("resolve deepseek-flash deepseek 2026-09-15T02:00:00Z", ctx);
-	const hitText = ctx.notifications.at(-1);
-	assert.ok(hitText.includes("命中"), "resolve 应输出命中链");
-
-	ctx.notifications.length = 0;
 	await handler("scheme", ctx);
 	assert.ok(ctx.notifications.at(-1).includes("工作日高峰"), "plan 列表含方案名");
 
 	ctx.notifications.length = 0;
 	await handler("bogus", ctx);
-	assert.ok(ctx.notifications.at(-1).includes("/price resolve"), "未知子命令给 help");
+	assert.ok(ctx.notifications.at(-1).includes("/price"), "未知子命令给 help");
+	assert.ok(ctx.notifications.at(-1).includes("scheme"), "help 包含现役子命令");
 	rmSync(dir, { recursive: true, force: true });
 });
 // ── v0.5 编辑面（PricingDraft）───────────────────────────────────────────
@@ -824,58 +804,96 @@ test("draft：listProviderPlans 列出全部方案", () => {
 	rmSync(dir, { recursive: true, force: true });
 });
 
-// ── v0.5 CLI：/price move 绑定优先级 ─────────────────────────────────────
-
-test("挂载：/price move 上移绑定 → 优先级改变（first match wins）", async () => {
+test("draft：schedule 五字段可编辑（星期/时段/日历/指定/排除）", () => {
 	const dir = tmpDir();
 	const path = join(dir, "pricing.json");
 	writePricing(FIXTURE, path);
-	const { handler } = mountAt(path);
-	const ctx = cmdCtx({ withCustom: false });
-	ctx.ui = { notify: ctx.ui.notify };
 
-	// 默认：peakworkday 在前 → 峰时 8
-	assert.equal(resolvePricing("deepseek-flash", "deepseek", PEAK_TS, path).output, 8);
+	const draft = new PricingDraft(path);
+	// 星期：工作日 → 仅周三
+	assert.equal(draft.setScheduleWeekdays("peakworkday", 0, [3]), true);
+	// 时段：改为全天（清空）
+	assert.equal(draft.setScheduleRanges("peakworkday", 0, []), true);
+	// 日历引用：include holidays
+	assert.equal(draft.setScheduleCalendar("peakworkday", 0, "holidays", "include"), true);
+	// 指定/排除日期
+	assert.equal(draft.setScheduleIncludeDates("peakworkday", 0, ["2026-10-01"]), true);
+	assert.equal(draft.setScheduleExcludeDates("peakworkday", 0, ["12-31"]), true);
 
-	// 把 valleyalways 移到最前
-	await handler("move deepseek deepseek-flash valleyalways top", ctx);
-	assert.ok(ctx.notifications.at(-1).includes("已移动"));
+	const s = draft.snapshot().plans.peakworkday.rules[0].schedule;
+	assert.deepEqual(s.weekdays, [3]);
+	assert.deepEqual(s.ranges, []);
+	assert.equal(s.calendar, "holidays");
+	assert.equal(s.calendarMode, "include");
+	assert.deepEqual(s.includeDates, ["2026-10-01"]);
+	assert.deepEqual(s.excludeDates, ["12-31"]);
 
-	const order = JSON.parse(readFileSync(path, "utf8"))
-		.providers.deepseek.models["deepseek-flash"].plans.map((b) => b.plan);
-	assert.deepEqual(order, ["valleyalways", "peakworkday"], "谷价方案应排到最前");
-	assert.equal(resolvePricing("deepseek-flash", "deepseek", PEAK_TS, path).output, 4, "谷价优先后峰时也给谷价");
-
-	// 再 down 移回
-	await handler("move deepseek deepseek-flash valleyalways down", ctx);
-	assert.equal(resolvePricing("deepseek-flash", "deepseek", PEAK_TS, path).output, 8, "下移后峰价恢复");
+	// 清除日历引用
+	draft.setScheduleCalendar("peakworkday", 0, undefined, undefined);
+	assert.equal(draft.snapshot().plans.peakworkday.rules[0].schedule.calendar, undefined);
+	assert.deepEqual(draft.changedAreas, ["方案"]);
 	rmSync(dir, { recursive: true, force: true });
 });
 
-test("挂载：/price move 越界不破坏数据；无效方向被拒", async () => {
+test("draft：方案/价格/日历改名（空串回退为 id）", () => {
 	const dir = tmpDir();
 	const path = join(dir, "pricing.json");
 	writePricing(FIXTURE, path);
-	const { handler } = mountAt(path);
-	const ctx = cmdCtx({ withCustom: false });
-	ctx.ui = { notify: ctx.ui.notify };
 
-	// up 已在最前：空操作 + 提示
-	await handler("move deepseek deepseek-flash peakworkday up", ctx);
-	assert.ok(ctx.notifications.at(-1).includes("最高优先级"), "应提示已在最高优先级");
+	const draft = new PricingDraft(path);
+	assert.equal(draft.setPlanName("peakworkday", "改后名称"), true);
+	assert.equal(draft.setPriceName("peak", "改后价格"), true);
+	assert.equal(draft.setCalendarName("holidays", "改后日历"), true);
+	const snap = draft.snapshot();
+	assert.equal(snap.plans.peakworkday.name, "改后名称");
+	assert.equal(snap.prices.peak.name, "改后价格");
+	assert.equal(snap.calendars.holidays.name, "改后日历");
 
-	ctx.notifications.length = 0;
-	await handler("move deepseek deepseek-flash peakworkday sideways", ctx);
-	assert.ok(ctx.notifications.at(-1).includes("无效方向"), "无效方向应被拒");
+	draft.setPlanName("peakworkday", "");
+	assert.equal(snap.plans.peakworkday.name, "peakworkday", "空串应回退为 id");
+	rmSync(dir, { recursive: true, force: true });
+});
 
-	ctx.notifications.length = 0;
-	await handler("move deepseek deepseek-flash nonexistent up", ctx);
-	assert.ok(ctx.notifications.at(-1).includes("未绑定"), "未绑定方案应报错");
+test("draft：日历日期增删（去重保序）", () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
 
-	// 数据未被破坏
-	const order = JSON.parse(readFileSync(path, "utf8"))
-		.providers.deepseek.models["deepseek-flash"].plans.map((b) => b.plan);
-	assert.deepEqual(order, ["peakworkday", "valleyalways"]);
+	const draft = new PricingDraft(path);
+	assert.equal(draft.addCalendarDates("holidays", ["2026-01-02", "2026-01-02", "2026-10-01"]), true);
+	assert.deepEqual(draft.snapshot().calendars.holidays.dates, ["2026-01-01", "2026-09-15", "2026-01-02", "2026-10-01"]);
+
+	assert.equal(draft.removeCalendarDate("holidays", "2026-01-02"), true);
+	assert.equal(draft.removeCalendarDate("holidays", "2026-01-02"), false, "不存在时返回 false");
+
+	// 覆盖式设置（去重）
+	assert.equal(draft.setCalendarDates("holidays", ["12-31", "12-31", "12-25"]), true);
+	assert.deepEqual(draft.snapshot().calendars.holidays.dates, ["12-31", "12-25"]);
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("draft：moveBinding 四个方向调整优先级", () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+	const plansOf = () =>
+		draft.snapshot().providers.deepseek.models["deepseek-flash"].plans.map((b) => b.plan);
+
+	const draft = new PricingDraft(path);
+	assert.equal(draft.moveBinding("deepseek", "deepseek-flash", "valleyalways", "top"), true);
+	assert.deepEqual(plansOf(), ["valleyalways", "peakworkday"]);
+
+	assert.equal(draft.moveBinding("deepseek", "deepseek-flash", "valleyalways", "down"), true);
+	assert.deepEqual(plansOf(), ["peakworkday", "valleyalways"]);
+
+	assert.equal(draft.moveBinding("deepseek", "deepseek-flash", "peakworkday", "bottom"), true);
+	assert.deepEqual(plansOf(), ["valleyalways", "peakworkday"]);
+
+	assert.equal(draft.moveBinding("deepseek", "deepseek-flash", "不存在", "top"), false, "未知方案应返回 false");
+	// 边界：已在最前，up 不动
+	assert.equal(draft.moveBinding("deepseek", "deepseek-flash", "valleyalways", "up"), true);
+	assert.deepEqual(plansOf(), ["valleyalways", "peakworkday"]);
+	assert.deepEqual(draft.changedAreas, ["模型"]);
 	rmSync(dir, { recursive: true, force: true });
 });
 
@@ -1038,6 +1056,76 @@ test("抽屉：Ctrl+R 丢弃未保存改动", async () => {
 	rmSync(dir, { recursive: true, force: true });
 });
 
+test("v0.11.1 抽屉：Ctrl+S 在增强键盘协议（CSI-u / modifyOtherKeys）下仍能保存", async () => {
+	// 根因：pi-tui 启用 Kitty/modifyOtherKeys 后，支持该协议的终端把 Ctrl+S
+	// 编码为 \x1b[115;5u（CSI-u）或 \x1b[27;5;115~，裸字节 \u0013 永不命中。
+	// 用裸字节保存两个用例各自验证一次 CSI-u 与 modifyOtherKeys 编码。
+	for (const seq of ["\u0013", "\u001b[115;5u", "\u001b[27;5;115~"]) {
+		const dir = tmpDir();
+		const path = join(dir, "pricing.json");
+		writePricing(FIXTURE, path);
+		const ctx = drawerCtx();
+		await new PricingDrawer(path).open(ctx);
+		const handle = runDrawer(ctx.captured);
+
+		handle.handleInput("\r");        // deepseek
+		handle.handleInput("\r");        // deepseek-flash
+		handle.handleInput("\r");        // 第一条绑定（peakworkday）
+		handle.handleInput("\r");        // 执行禁用
+		handle.handleInput("\x1b"); handle.handleInput("\x1b");
+		assert.ok(plainOf(handle).includes("未保存改动"), `${JSON.stringify(seq)} 前应显示未保存`);
+
+		handle.handleInput(seq);         // Ctrl+S（三种编码各测一次）
+		const out = plainOf(handle);
+		assert.ok(out.includes("已保存"), `编码 ${JSON.stringify(seq)} 保存后应显示已保存`);
+		assert.ok(out.includes("保存成功"), `编码 ${JSON.stringify(seq)} 应显示保存成功反馈`);
+		assert.equal(resolvePricing("deepseek-flash", "deepseek", PEAK_TS, path).output, 4, `编码 ${JSON.stringify(seq)} 改动应落盘`);
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("v0.11.1 抽屉：Ctrl+R 在增强键盘协议（CSI-u / modifyOtherKeys）下仍能重置", async () => {
+	for (const seq of ["\u0012", "\u001b[114;5u", "\u001b[27;5;114~"]) {
+		const dir = tmpDir();
+		const path = join(dir, "pricing.json");
+		writePricing(FIXTURE, path);
+		const ctx = drawerCtx();
+		await new PricingDrawer(path).open(ctx);
+		const handle = runDrawer(ctx.captured);
+
+		handle.handleInput("\r"); handle.handleInput("\r"); handle.handleInput("\r"); handle.handleInput("\r");
+		handle.handleInput("\x1b"); handle.handleInput("\x1b");
+		assert.ok(plainOf(handle).includes("未保存改动"), `${JSON.stringify(seq)} 前应显示未保存`);
+
+		handle.handleInput(seq);         // Ctrl+R（三种编码各测一次）
+		const out = plainOf(handle);
+		assert.ok(out.includes("已保存"), `编码 ${JSON.stringify(seq)} 重置后应显示已保存`);
+		assert.ok(out.includes("已丢弃"), `编码 ${JSON.stringify(seq)} 应提示已丢弃`);
+		assert.equal(resolvePricing("deepseek-flash", "deepseek", PEAK_TS, path).output, 8, `编码 ${JSON.stringify(seq)} 磁盘不应被改动`);
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("v0.11.1 抽屉：保存失败时状态栏显示失败原因且不落盘", async () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	const broken = structuredClone(FIXTURE);
+	broken.plans.peakworkday.rules[0].price = "missing";   // 引用不存在的价格
+	writePricing(broken, path);
+	const ctx = drawerCtx();
+	await new PricingDrawer(path).open(ctx);
+	const handle = runDrawer(ctx.captured);
+
+	handle.handleInput("\u0013");        // Ctrl+S
+	const out = plainOf(handle);
+	assert.ok(out.includes("保存失败"), "应显示保存失败反馈");
+	assert.ok(out.includes("missing"), "失败原因应说明引用了不存在的价格");
+
+	// 磁盘保持原样（未被改写）
+	assert.deepEqual(readPricing(path), broken, "校验失败不应落盘");
+	rmSync(dir, { recursive: true, force: true });
+});
+
 test("v0.7 根层只含模型：管理面入口不再挂在厂商列表尾部", async () => {
 	const dir = tmpDir();
 	const path = join(dir, "pricing.json");
@@ -1164,7 +1252,7 @@ test("v0.6 绑定优先级：详情页显示 #N 序号与先匹配标注", async
 	assert.ok(detail.includes("#1"), "应显示优先级 #1");
 	assert.ok(detail.includes("#2"), "应显示优先级 #2");
 	assert.ok(detail.includes("先匹配"), "首个绑定应标注先匹配");
-	assert.ok(detail.includes("排序用 /price move"), "应提示排序命令");
+	assert.ok(detail.includes("绑定重排入口规划中"), "应注明重排入口待提供");
 	// 顺序应与 plans 数组一致
 	const i1 = detail.indexOf("#1");
 	const i2 = detail.indexOf("#2");
@@ -1216,13 +1304,13 @@ test("v0.6 抽屉内新建方案：id 重复被拒且不写入", async () => {
 	let overlay = null;
 	const tui = { showOverlay: (comp) => { overlay = comp; return { hide() {} }; } };
 	const handle = ctx.captured.factory(tui, { fg: (c, t) => t, bold: (t) => t }, {}, () => {});
-	const plain = () => handle.render(100).join("\n").replace(/\u001b\[\d+(;\d+)*m/g, "");
+	const overlayPlain = () => overlay.render(100).join("\n").replace(/\u001b\[\d+(;\d+)*m/g, "");
 
 	handle.handleInput("\r");
 	overlay.handleInput("valleyalways");   // 已存在的方案 id
 	overlay.handleInput("\r");
 
-	assert.ok(plain().includes("已存在"), "重复 id 应提示已存在");
+	assert.ok(overlayPlain().includes("已存在"), "重复 id 应在弹窗内提示已存在");
 	// 原有方案规则数不变
 	assert.equal(readPricing(path).plans.valleyalways.rules.length, 1, "不应破坏已有方案");
 	rmSync(dir, { recursive: true, force: true });
@@ -1262,6 +1350,7 @@ test("v0.6 抽屉内新建日历：两步输入 + 非法日期被拒", async () 
 	const tui = { showOverlay: (comp) => { overlay = comp; return { hide() {} }; } };
 	const handle = ctx.captured.factory(tui, { fg: (c, t) => t, bold: (t) => t }, {}, () => {});
 	const plain = () => handle.render(100).join("\n").replace(/\u001b\[\d+(;\d+)*m/g, "");
+	const overlayPlain = () => overlay.render(100).join("\n").replace(/\u001b\[\d+(;\d+)*m/g, "");
 
 	handle.handleInput("\r");   // 新建日历（首项）
 	overlay.handleInput("promo-2026");
@@ -1286,7 +1375,7 @@ test("v0.6 抽屉内新建日历：两步输入 + 非法日期被拒", async () 
 	overlay.handleInput("\r");
 	overlay.handleInput("2026-13-99");
 	overlay.handleInput("\r");
-	assert.ok(plain().includes("无效日期"), "非法日期应被拒");
+	assert.ok(overlayPlain().includes("无效日期"), "非法日期应在弹窗内提示");
 	assert.equal(readPricing(path).calendars["bad-cal"], undefined, "非法日期不应写入");
 	rmSync(dir, { recursive: true, force: true });
 });
@@ -1704,7 +1793,7 @@ test("v0.8 补全第 1 层：空输入返回全部一级子命令", () => {
 
 	const all = valuesOf(fn, "");
 	assert.deepEqual(all, subcommandNames(), "应返回全部子命令且顺序一致");
-	assert.equal(all.length, 11, "当前共 11 个一级子命令");
+	assert.equal(all.length, 6, "当前共 6 个一级子命令（v0.10 收敛后）");
 	// 每项都带中文说明
 	const items = fn("");
 	assert.ok(items.every((i) => typeof i.description === "string" && i.description.length > 0), "每项应有说明");
@@ -1716,8 +1805,8 @@ test("v0.8 补全第 1 层：前缀过滤", () => {
 	const path = writeFixture(dir);
 	const fn = completionsAt(path);
 
-	assert.deepEqual(valuesOf(fn, "sch"), ["scheme", "schema"]);
-	assert.deepEqual(valuesOf(fn, "r"), ["rate", "resolve"]);
+	assert.deepEqual(valuesOf(fn, "sch"), ["scheme"], "schema 已移除，仅匹配 scheme");
+	assert.deepEqual(valuesOf(fn, "r"), ["rate"], "resolve 已移除，仅匹配 rate");
 	assert.deepEqual(valuesOf(fn, "cal"), ["calendar"]);
 	assert.equal(valuesOf(fn, "zzz"), null, "无匹配应返回 null（pi 约定）");
 	rmSync(dir, { recursive: true, force: true });
@@ -1749,28 +1838,13 @@ test("v0.8 补全第 3 层：动态 id（来自当前配置）", () => {
 	rmSync(dir, { recursive: true, force: true });
 });
 
-test("v0.8 补全：provider / model / plan 逐列递进", () => {
+test("v0.8 补全：provider / model 逐列递进", () => {
 	const dir = tmpDir();
 	const path = writeFixture(dir);
 	const fn = completionsAt(path);
 
 	assert.deepEqual(valuesOf(fn, "model "), ["deepseek", "glm"], "model 第 1 列是 provider");
 	assert.deepEqual(valuesOf(fn, "model deepseek "), ["deepseek-flash"], "model 第 2 列限定该 provider 的模型");
-	assert.deepEqual(valuesOf(fn, "bind "), ["deepseek", "glm"]);
-	assert.deepEqual(valuesOf(fn, "bind deepseek "), ["deepseek-flash"]);
-	assert.deepEqual(valuesOf(fn, "bind deepseek deepseek-flash "), ["peakworkday", "valleyalways"], "已绑定方案优先");
-	// resolve 的位置语义是 <model> [provider] [ts]
-	assert.deepEqual(valuesOf(fn, "resolve "), ["deepseek-flash", "glm-5.3-flash"], "resolve 第 1 列是模型");
-	rmSync(dir, { recursive: true, force: true });
-});
-
-test("v0.8 补全：move 方向为第 4 列", () => {
-	const dir = tmpDir();
-	const path = writeFixture(dir);
-	const fn = completionsAt(path);
-
-	assert.deepEqual(valuesOf(fn, "move deepseek deepseek-flash peakworkday "), ["up", "down", "top", "bottom"]);
-	assert.deepEqual(valuesOf(fn, "move deepseek deepseek-flash peakworkday u"), ["up"]);
 	rmSync(dir, { recursive: true, force: true });
 });
 
@@ -1780,7 +1854,6 @@ test("v0.8 补全：无位置参数的子命令不补", () => {
 	const fn = completionsAt(path);
 
 	assert.equal(valuesOf(fn, "list "), null);
-	assert.equal(valuesOf(fn, "schema "), null);
 	assert.equal(valuesOf(fn, "help "), null);
 	rmSync(dir, { recursive: true, force: true });
 });
@@ -1832,4 +1905,418 @@ test("v0.8 一致性：cli-spec 的 children 与实现动作一致", () => {
 	}
 	assert.ok(findSubcommand("scheme"), "findSubcommand 应能查到 scheme");
 	assert.equal(findSubcommand("nonexistent"), undefined);
+});
+
+// ── v0.9 结构化说明信息排版（InfoPage + Markdown 渲染器）───────────────
+
+test("v0.9 renderHelpMarkdown：数据驱动、含全部子命令、不提旧名", () => {
+	const md = renderHelpMarkdown();
+	// 标题与分组
+	assert.ok(md.includes("# /price — 模型计费"), "应含 H1 标题");
+	for (const name of subcommandNames()) {
+		assert.ok(md.includes(`/price ${name}`), `help 应列出 /price ${name}`);
+	}
+	// 二级动作也列出
+	assert.ok(md.includes("`/price scheme create <id> [name]`"), "scheme create 子项应列出带占位符");
+	assert.ok(md.includes("`/price rate set <id> <field> <value>`"), "rate set 子项应列出");
+	// 命令行不得把旧名列为可用命令（命名沿革只出现在"注"里）
+	const commandLines = md.split("\n").filter((l) => /^- `\/price/.test(l));
+	assert.ok(!commandLines.some((l) => /\/price plan\b/.test(l)), "不应再把 /price plan 列为命令");
+	assert.ok(!commandLines.some((l) => /\/price price\b/.test(l)), "不应再把 /price price 列为命令");
+});
+
+test("v0.9 renderSchemaMarkdown：代码块结构 + 语义", () => {
+	const md = renderSchemaMarkdown();
+	assert.ok(md.includes("# Schema v2"), "应含 H1 标题");
+	assert.ok(md.includes("## 顶层结构"), "应含顶层结构小节");
+	assert.ok(md.includes("## PricingRule"), "应含 PricingRule 小节");
+	assert.ok(md.includes("## 语义"), "应含语义小节");
+	assert.ok(/```\ncalendars:/.test(md), "顶层结构应为代码块且含 calendars");
+	assert.ok(md.includes("first match wins"), "语义应含 first match wins");
+	assert.ok(!md.includes("ranges?: Schedule"), "不应保留 v1 的嵌套 ranges 写法");
+});
+
+test("v0.9 renderResolveResultMarkdown / renderModelDetailMarkdown 渲染", () => {
+	const dir = tmpDir();
+	const path = writeFixture(dir);
+	const r = renderResolveResultMarkdown("deepseek-flash", "deepseek", PEAK_TS, path);
+	assert.ok(r.includes("# 解析 deepseek/deepseek-flash"), "应含解析标题");
+	assert.ok(r.includes("**✓ 命中**"), "命中链应加粗命中标记");
+	const miss = renderResolveResultMarkdown("deepseek-flash", "deepseek", SUN_TS, path);
+	assert.ok(miss.includes("✗ 未中"), "未中应保留标记");
+	const d = renderModelDetailMarkdown("deepseek", "deepseek-flash", path);
+	assert.ok(d.includes("# deepseek/deepseek-flash"), "应含模型标题");
+	assert.ok(d.includes("**别名**: `deepseek-v4-flash`"), "别名以 code 展示");
+	assert.ok(d.includes("工作日高峰"), "价格卡片应含方案");
+	// 向下钻取 InfoPage 不抛错且能渲染
+	const theme = { fg: (c, t) => t, bold: (t) => t };
+	assert.ok(new InfoPage(r, theme, () => {}).render(80).length > 0);
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.9 InfoPage：固定窗口 + 滚动 + Esc 返回", () => {
+	const theme = { fg: (c, t) => t, bold: (t) => t };
+	let closed = 0;
+	const page = new InfoPage(renderHelpMarkdown(), theme, () => { closed += 1; });
+	const first = page.render(80);
+	assert.equal(first.length, MAX_INFO_LINES + 1, "内容行 + 底部提示条");
+	assert.ok(first.at(-1).includes("↑↓ 滚动"), "底部应有滚动画提示");
+	assert.ok(page.render(80)[0].includes("/price — 模型计费"), "首屏应从标题开始");
+	// 向下滚动：内容应前进
+	page.handleInput("\x1b[6~"); // PgDn
+	const second = page.render(80);
+	assert.ok(!second.slice(0, -1).some((l) => l.includes("/price — 模型计费")), "翻页后标题行应移出窗口");
+	// 回滚到顶、到底边界不越界
+	page.handleInput("\x1b[H"); // Home
+	assert.equal(page.render(80)[0], first[0], "Home 应回到顶部");
+	page.handleInput("\x1b[F"); // End
+	page.handleInput("\x1b[B"); // Down（已到底，不越界也不抛错）
+	const bottom = page.render(80);
+	assert.equal(bottom.length, MAX_INFO_LINES + 1);
+	// Esc 走 goBack
+	page.handleInput("\x1b");
+	assert.equal(closed, 1, "Esc 应触发 goBack");
+});
+
+test("v0.9 抽屉：/price help 直达 InfoPage（标题 + 内容 + Esc 关闭）", async () => {
+	const dir = tmpDir();
+	const path = writeFixture(dir);
+	const { handler } = mountAt(path);
+
+	{
+		const tui = cmdCtx({ withCustom: true });
+		await handler("help", tui);
+		assert.ok(tui.captured.factory, "help 应开抽屉");
+		const handle = runDrawer(tui.captured);
+		const out = plainOf(handle);
+		assert.ok(out.includes("帮助"), "help 抽屉标题应为帮助页");
+		assert.ok(out.includes(renderHelpMarkdown().split("\n")[0].replace(/^# /, "")), "help 抽屉正文应渲染说明内容");
+		handle.handleInput("\x1b");
+		assert.equal(handle.doneCount(), 1, "help 直达页 Esc 一次应关闭抽屉");
+	}
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.9 命令：/price help headless 回退纯文本（不进抽屉）", async () => {
+	const dir = tmpDir();
+	const path = writeFixture(dir);
+	const { handler } = mountAt(path);
+	const ctx = cmdCtx({ withCustom: false });
+	ctx.ui = { notify: ctx.ui.notify };
+	await handler("help", ctx);
+	assert.ok(!ctx.captured.factory, "help headless 不应开抽屉");
+	assert.ok(ctx.notifications.at(-1).includes(renderHelp().split("\n").find((l) => l.trim().length > 0).trim().slice(0, 5)), "help headless 应输出纯文本");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.9 renderPriceListMarkdown：标题/厂商/模型/方案与实时价结构", () => {
+	const dir = tmpDir();
+	const path = writeFixture(dir);
+	const md = renderPriceListMarkdown(path);
+	assert.ok(md.includes("# 模型计费总览"), "应含 H1 总览标题");
+	assert.ok(md.includes("## deepseek"), "应含厂商 H2");
+	assert.ok(md.includes("### deepseek-flash（aka `deepseek-v4-flash`）"), "模型 H3 带别名 code");
+	assert.ok(md.includes("- 工作日高峰：输出"), "价格卡片为列表项");
+	assert.ok(md.includes("**当前生效**"), "应有实时生效行");
+	assert.ok(md.includes("`/price scheme|rate|calendar`"), "底部应有管理面提示");
+	const empty = join(dir, "empty.json");
+	writePricing({ version: 2, providers: {}, plans: {}, prices: {}, calendars: {} }, empty);
+	const emptyMd = renderPriceListMarkdown(empty);
+	assert.ok(emptyMd.includes("暂无模型计费数据"), "空配置给占位文案");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.9 抽屉：/price list 直达 InfoPage 总览（Markdown 渲染 + Esc 一次关闭）", async () => {
+	const dir = tmpDir();
+	const path = writeFixture(dir);
+	const { handler } = mountAt(path);
+	const tui = cmdCtx({ withCustom: true });
+	await handler("list", tui);
+	assert.ok(tui.captured.factory, "list 应开抽屉");
+	const handle = runDrawer(tui.captured);
+	const out = plainOf(handle);
+	// 真实内容断言：总览标题 + 厂商 H2（区别于 v0.8 只断言工厂被调的假阳性）
+	assert.ok(out.includes("总览"), "抽屉标题应为总览页");
+	assert.ok(out.includes("模型计费总览"), "正文应渲染 Markdown H1");
+	assert.ok(out.includes("deepseek"), "正文应含厂商");
+	handle.handleInput("\x1b");
+	assert.equal(handle.doneCount(), 1, "总览直达页 Esc 一次应关闭抽屉");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.9 抽屉：/price model 直达 InfoPage；headless 仍回退文本", async () => {
+	const dir = tmpDir();
+	const path = writeFixture(dir);
+	const { handler } = mountAt(path);
+
+	// model：TUI 开详情只读页
+	const tuiM = cmdCtx({ withCustom: true });
+	await handler("model deepseek deepseek-flash", tuiM);
+	const outM = plainOf(runDrawer(tuiM.captured));
+	assert.ok(outM.includes("模型详情"), "model 抽屉标题应为详情页");
+	assert.ok(outM.includes("deepseek/deepseek-flash"), "正文应渲染模型标题");
+	assert.ok(outM.includes("工作日高峰"), "正文应含绑定方案");
+
+	// headless：不开抽屉，回退纯文本
+	const head = cmdCtx({ withCustom: false });
+	head.ui = { notify: head.ui.notify };
+	await handler("model deepseek deepseek-flash", head);
+	assert.ok(!head.captured.factory, "model headless 不应开抽屉");
+	assert.ok(head.notifications.at(-1).includes("deepseek-flash"), "model headless 应输出纯文本");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+// ── v0.10 PriceFormPage 与 Esc 语义修复 ──────────────────────────────────
+
+test("v0.10 PriceFormPage：就地编辑输出价（Enter 打开 → Esc 取消 → 重进提交 → Ctrl+S 落盘）", async () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+	const ctx = drawerCtx();
+	await new PricingDrawer(path).open(ctx, "rate");
+	const handle = runDrawer(ctx.captured);
+
+	handle.handleInput("\u001b[B");  // 下移：＋新建 → 峰价
+	handle.handleInput("\r");        // 进入峰价的 PriceFormPage
+	assert.ok(plainOf(handle).includes("价格字段"), "应进入字段页");
+
+	handle.handleInput("\r");        // 选中行0 = 输出价 → 打开 Input 编辑器
+	let out = plainOf(handle);
+	assert.ok(out.includes("输出价（¥/百万 token）"), "编辑器应显示字段标题");
+	assert.ok(!out.includes("价格字段"), "编辑器中不应再显示字段列表");
+
+	handle.handleInput("\x1b");      // Esc：关闭编辑器，不提交
+	out = plainOf(handle);
+	assert.ok(out.includes("价格字段"), "Esc 后应回到字段页");
+	assert.ok(out.includes("¥8.00"), "输出价应仍为 8（未提交）");
+
+	handle.handleInput("\r");        // 重开输出价编辑器（预填 8）
+	handle.handleInput("\u0005");    // Ctrl+E 光标到末尾
+	handle.handleInput("\x7f");      // Backspace 删掉 8
+	handle.handleInput("9");
+	handle.handleInput("\r");        // 提交
+	out = plainOf(handle);
+	assert.ok(out.includes("¥9.00"), "提交后字段详情应显示新值 ¥9.00");
+	assert.ok(out.includes("价格字段"), "提交后应回到字段页");
+
+	handle.handleInput("\u0013");    // Ctrl+S
+	const saved = readPricing(path);
+	assert.equal(saved.prices.peak.output, 9, "输出价应被写入磁盘");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.10 方案改名 Esc：overlay 取消后仍在操作菜单（不退出 ActionMenu）", async () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+	const ctx = drawerCtx();
+	await new PricingDrawer(path).open(ctx, "scheme");
+
+	let overlay = null;
+	const tui = { showOverlay: (comp) => { overlay = comp; return { hide() {} }; } };
+	const theme = { fg: (c, t) => t, bold: (t) => t };
+	const handle = ctx.captured.factory(tui, theme, {}, () => {});
+
+	// 下移到 工作日高峰 → 进入方案操作 → 进入 __ops ActionMenu
+	handle.handleInput("\u001b[B");  // ＋新建方案 → 工作日高峰
+	handle.handleInput("\r");        // 进入方案操作（规则#0 + __ops）
+	assert.ok(plainOf(handle).includes("规则 #0"), "应进入方案操作页");
+
+	const down = () => { handle.handleInput("\u001b[B"); };
+	for (let i = 0; i < 3; i++) down(); // 移到「方案操作」
+	handle.handleInput("\r");        // 打开 ActionMenu
+	assert.ok(plainOf(handle).includes("重命名方案"), "应进入操作菜单");
+
+	handle.handleInput("\r");        // 重命名方案 → overlay 弹出
+	assert.ok(overlay !== null, "应弹出输入层");
+
+	overlay.handleInput("\x1b");     // Esc 关闭 overlay → onCancel 不调 finish()
+	const out = plainOf(handle);
+	assert.ok(out.includes("重命名方案"), "Esc 后仍在操作菜单（可见重命名选项）");
+	assert.ok(out.includes("方案 peakworkday 操作"), "标题应仍为 ActionMenu");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+// ── v0.11 PromptOverlay：标题/注脚/预填 + 内联校验 ────────────────────────
+
+/** 纯净渲染（去 ANSI），供组件级断言 */
+function cleanLines(lines) {
+	return lines.join("\n").replace(/\u001b\[\d+(;\d+)*m/g, "");
+}
+
+test("v0.11 PromptOverlay：布局含标题/注脚/键位提示，未修改即提交预填值", async () => {
+	const { PromptOverlay } = await jiti.import(`${SRC}/pricing-prompt.ts`);
+	const theme = { fg: (c, t) => t, bold: (t) => t };
+	const seen = [];
+	const p = new PromptOverlay({
+		title: "标题行",
+		notes: ["说明甲", "说明乙"],
+		placeholder: "占位提示",
+		initialValue: "旧值",
+		onSubmit: (v) => seen.push(v),
+		onCancel: () => seen.push("cancel"),
+	}, theme);
+
+	const out = cleanLines(p.render(80));
+	assert.ok(out.includes("标题行"), "应显示标题");
+	assert.ok(out.includes("注：说明甲"), "应显示帮助脚注 1");
+	assert.ok(out.includes("注：说明乙"), "应显示帮助脚注 2");
+	assert.ok(out.includes("submit"), "应显示 submit 键位提示");
+	assert.ok(out.includes("cancel"), "应显示 cancel 键位提示");
+	assert.ok(out.includes("旧值"), "预填值应渲染在输入框内");
+
+	p.handleInput("\r");
+	assert.deepEqual(seen, ["旧值"], "未修改即提交应提交预填值");
+});
+
+test("v0.11 PromptOverlay：提交校验失败就地报错、输入不丢；继续输入清除错误", async () => {
+	const { PromptOverlay } = await jiti.import(`${SRC}/pricing-prompt.ts`);
+	const theme = { fg: (c, t) => t, bold: (t) => t };
+	const seen = [];
+	const p = new PromptOverlay({
+		title: "校验标题",
+		validate: (v) => (v === "ok" ? null : `必须是 ok，当前：${v}`),
+		onSubmit: (v) => seen.push(v),
+		onCancel: () => seen.push("cancel"),
+	}, theme);
+
+	p.handleInput("xx");
+	assert.ok(!cleanLines(p.render(80)).includes("必须是 ok"), "未提交前不应显示错误行");
+	p.handleInput("\r");
+	const out = cleanLines(p.render(80));
+	assert.ok(out.includes("必须是 ok"), "提交失败应在弹窗内显示错误行");
+	assert.ok(out.includes("当前：xx"), "错误行应含用户输入，证明输入未丢");
+	assert.deepEqual(seen, [], "失败不应触发 onSubmit");
+
+	p.handleInput("1");   // 任意输入 → 错误行清除，输入保留
+	assert.ok(!cleanLines(p.render(80)).includes("必须是 ok"), "继续输入后错误行应被清除");
+	p.handleInput("\r");
+	assert.ok(cleanLines(p.render(80)).includes("当前：xx1"), "值 xx1 应保留且再次报错");
+	assert.deepEqual(seen, [], "仍未提交成功");
+
+	// 合法值路径：清空重来
+	p.handleInput("\x1b");
+	assert.deepEqual(seen, ["cancel"], "Esc 应走 onCancel");
+});
+
+test("v0.11 PromptOverlay：合法值提交触发 onSubmit", async () => {
+	const { PromptOverlay } = await jiti.import(`${SRC}/pricing-prompt.ts`);
+	const theme = { fg: (c, t) => t, bold: (t) => t };
+	const seen = [];
+	const p = new PromptOverlay({
+		title: "提交",
+		validate: (v) => (v === "ok" ? null : "bad"),
+		onSubmit: (v) => seen.push(v),
+		onCancel: () => seen.push("cancel"),
+	}, theme);
+
+	p.handleInput("ok");
+	p.handleInput("\r");
+	assert.deepEqual(seen, ["ok"], "合法值应触发 onSubmit");
+});
+
+test("v0.11 日期编辑器：＋添加 弹窗带格式脚注，非法/重复就地校验不落值", async () => {
+	const { buildDatesEditor } = await jiti.import(`${SRC}/pricing-form.ts`);
+	const theme = { fg: (c, t) => t, bold: (t) => t };
+	const requests = [];
+	let commitValue = null;
+	const editor = buildDatesEditor(["01-01"], theme,
+		(req) => requests.push(req),
+		(result) => { commitValue = result; },
+	);
+
+	editor.handleInput("\u001b[B");   // 移到 ＋ 添加
+	editor.handleInput("\r");
+	assert.equal(requests.length, 1, "应发起添加请求");
+	const req = requests[0];
+	assert.ok(req.notes.some((n) => n.includes("MM-DD")), "弹窗应带日期格式脚注");
+
+	assert.ok(req.validate("2026-13-99"), "非法月份应被校验拦截");
+	assert.ok(req.validate("04-31"), "4 月 31 日应被校验拦截");
+	assert.equal(req.validate("2026-02-29"), null, "2 月 29 应通过（按闰年上限）");
+	const dup = req.validate("01-01");
+	assert.ok(dup && dup.includes("已存在"), "重复日期应提示已存在");
+
+	req.onSubmit("2026-13-99");  // 防御：非法值即使绕到 onSubmit 也不落值
+	req.onSubmit("02-14");       // 合法值落值
+	editor.handleInput("\x1b");  // Esc 提交当前列表
+	assert.deepEqual(commitValue, ["01-01", "02-14"], "列表应为原值 + 合法新值");
+});
+
+// ── v0.11 页面级注脚 ─────────────────────────────────────────────────────
+
+test("v0.11 页面注脚：models/scheme/rate/calendar 根页显示上下文说明", async () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+
+	let d = await openDrawerWith(path, "models");
+	assert.ok(d.plain().includes("注：绑定数组顺序即优先级"), "models 根页应有绑定优先级说明");
+
+	d = await openDrawerWith(path, "scheme");
+	assert.ok(d.plain().includes("注：命名沿革"), "scheme 根页应有命名沿革说明");
+
+	d = await openDrawerWith(path, "rate");
+	assert.ok(d.plain().includes("注：命名沿革"), "rate 根页应有命名沿革说明");
+
+	d = await openDrawerWith(path, "calendar");
+	assert.ok(d.plain().includes("注：日期格式"), "calendar 根页应有日期格式说明");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.11 模型详情只读页：InfoPage 页脚含绑定优先级说明", async () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+	const ctx = drawerCtx();
+	await new PricingDrawer(path).open(ctx);
+	const handle = runDrawer(ctx.captured);
+
+	handle.handleInput("\r");   // deepseek 厂商 → 模型列表
+	handle.handleInput("\r");   // 首个模型 → 模型操作页
+	// 下移到「查看只读详情」
+	let found = false;
+	for (let i = 0; i < 14 && !found; i++) {
+		const row = plainOf(handle).split("\n").map((l) => l.trim()).find((l) => l.startsWith("→"));
+		if (row && row.includes("查看只读详情")) found = true;
+		else handle.handleInput("\u001b[B");
+	}
+	assert.ok(found, "应能找到查看只读详情");
+	handle.handleInput("\r");
+	const out = plainOf(handle);
+	assert.ok(out.includes("注：绑定数组顺序即优先级"), "模型详情只读页应含绑定优先级页脚");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.11 PriceFormPage：非法价格就地报错（不离开编辑器、不写状态栏），修正后可提交", async () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+	const ctx = drawerCtx();
+	await new PricingDrawer(path).open(ctx, "rate");
+	const handle = runDrawer(ctx.captured);
+
+	handle.handleInput("\u001b[B");  // ＋新建价格 → 峰价
+	handle.handleInput("\r");        // 进入 PriceFormPage
+	assert.ok(plainOf(handle).includes("价格字段"), "应进入字段页");
+
+	handle.handleInput("\r");        // 输出价 → 打开编辑器
+	handle.handleInput("abc");
+	handle.handleInput("\r");        // 非法提交
+	let out = plainOf(handle);
+	assert.ok(out.includes("无效价格"), "非法价格应就地报错");
+	assert.ok(out.includes("注：单位"), "编辑器应显示价格格式脚注");
+	assert.ok(!out.includes("价格字段"), "报错时不应退出编辑器");
+
+	handle.handleInput("\u0005");    // Ctrl+E 光标到末尾（任意输入会清除错误行）
+	out = plainOf(handle);
+	assert.ok(!out.includes("无效价格"), "继续输入后错误行应被清除");
+
+	handle.handleInput("\x7f"); handle.handleInput("\x7f"); handle.handleInput("\x7f"); handle.handleInput("\x7f");  // 删掉预填的 8 + abc
+	handle.handleInput("9.00");
+	handle.handleInput("\r");        // 合法提交
+	out = plainOf(handle);
+	assert.ok(out.includes("价格字段"), "提交后应回到字段页");
+	assert.ok(out.includes("¥9.00"), "字段详情应显示新值 ¥9.00");
+	rmSync(dir, { recursive: true, force: true });
 });

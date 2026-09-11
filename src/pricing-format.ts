@@ -102,6 +102,68 @@ function findModelConfig(
 	return undefined;
 }
 
+/** /price list 总览：所有厂商 + 模型价目卡片（Markdown 版，供 TUI InfoPage 排版） */
+export function renderPriceListMarkdown(filePath?: string): string {
+	const providers = listProviders(filePath);
+	const lines = [`# 模型计费总览`, ""];
+	if (providers.length === 0) {
+		lines.push("暂无模型计费数据。");
+		return lines.join("\n");
+	}
+	for (const prov of providers) {
+		const infos = listProviderModels(prov, undefined, filePath);
+		const planNames = [...new Set(infos.flatMap((i) => i.planBindings.map((b) => b.planName)))];
+		lines.push(`## ${prov}（${infos.length} 模型${planNames.length ? ` · ${planNames.join("·")}` : ""}）`, "");
+		for (const info of infos) {
+			lines.push(`### ${info.model}${info.alias ? `（aka \`${info.alias}\`）` : ""}`, "");
+			lines.push(...modelCardMarkdownLines(prov, info.model, filePath), "");
+		}
+	}
+	lines.push("> 编辑：无参 `/price` 在抽屉内启停/增删绑定（Ctrl+S 保存）；绑定重排入口规划中");
+	lines.push("");
+	lines.push("> 文件：`~/.pi/model-pricing.json` · 管理面：`/price scheme|rate|calendar`");
+	return lines.join("\n");
+}
+
+/** 模型价目卡片（Markdown 版）：绑定方案清单 + 实时生效行 */
+function modelCardMarkdownLines(provider: string, model: string, filePath?: string): string[] {
+	const schema = readPricing(filePath);
+	const prov = schema.providers[provider];
+	if (!prov) return [`（未知厂商 ${provider}）`];
+	const conf = findModelConfig(schema, prov, model);
+	if (!conf) return [`（未找到模型 ${model}）`];
+
+	const lines: string[] = [];
+	lines.push(`**绑定方案**: ${conf.plans.length} · 启用 ${conf.plans.filter((b) => b.enabled).length}`);
+	for (const binding of conf.plans) {
+		const plan = schema.plans[binding.plan];
+		if (!plan) {
+			lines.push(`- ${binding.plan}（方案不存在，脏数据）`);
+			continue;
+		}
+		if (!binding.enabled) {
+			lines.push(`- ${plan.name}（禁用）`);
+			continue;
+		}
+		for (const rule of plan.rules) {
+			const p = schema.prices[rule.price];
+			const desc = describeSchedule(rule.schedule);
+			if (!p) {
+				lines.push(`- ${plan.name}（价格引用 ${rule.price} 缺失，脏数据）〔${desc}〕`);
+				continue;
+			}
+			lines.push(`- ${plan.name}：输出 ${price(p.output)} · 输入 未缓存 ${price(p.input.miss)} / 缓存 ${price(p.input.hit)}〔${desc}〕${isAlwaysRule(rule) ? " ←基准" : ""}`);
+		}
+	}
+
+	// 实时生效行（resolveDebug 链尾 = 命中规则）
+	const debug = resolveDebug(model, provider, undefined, filePath);
+	const hitPlan = debug.chain.find((s) => s.matched)?.planName;
+	const live = debug.price;
+	lines.push(`- **当前生效**: 输出 ${price(live.output)} · 输入 未缓存 ${price(live.inputMiss)} / 缓存 ${price(live.inputHit)}${hitPlan ? `（命中 ${hitPlan}，${live.isPeak ? "高峰时段" : "普通时段"}）` : "（未命中→兜底价）"}`);
+	return lines;
+}
+
 /** /price model <provider> <model>：模型详情（绑定方案 + 实时生效 + 编辑提示） */
 export function renderModelDetail(provider: string, model: string, filePath?: string): string {
 	const schema = readPricing(filePath);
@@ -116,7 +178,30 @@ export function renderModelDetail(provider: string, model: string, filePath?: st
 	lines.push(`  绑定方案（${conf.plans.length} · 启用 ${conf.plans.filter((b) => b.enabled).length}）:`);
 	lines.push(...modelCardLines(provider, model, filePath));
 	lines.push("");
-	lines.push("  编辑: 无参 /price 在抽屉内启停/增删绑定（Ctrl+S 保存）；排序用 /price move");
+	lines.push("  编辑: 无参 /price 在抽屉内启停/增删绑定（Ctrl+S 保存）；绑定重排入口规划中");
+	return lines.join("\n");
+}
+
+/** /price model：模型详情（Markdown 版，供 TUI InfoPage 排版） */
+export function renderModelDetailMarkdown(provider: string, model: string, filePath?: string): string {
+	const schema = readPricing(filePath);
+	const prov = schema.providers[provider];
+	if (!prov) return `# 未知厂商 ${provider}`;
+	const conf = findModelConfig(schema, prov, model);
+	if (!conf) return `# ${provider} 下未找到模型 ${model}`;
+
+	const lines: string[] = [`# ${provider}/${model}`, ""];
+	if (conf.alias) lines.push(`**别名**: \`${conf.alias}\``);
+	lines.push(`**绑定方案**: ${conf.plans.length} · 启用 ${conf.plans.filter((b) => b.enabled).length}`);
+	lines.push("");
+	lines.push("## 价格卡片（first match wins）");
+	lines.push("");
+	for (const card of modelCardLines(provider, model, filePath)) {
+		lines.push(`- ${card.replace(/^\s+/, "")}`);
+	}
+	lines.push("");
+	lines.push("> 编辑: 无参 /price 在抽屉内启停/增删绑定（Ctrl+S 保存）；绑定重排入口规划中");
+	lines.push("");
 	return lines.join("\n");
 }
 
@@ -241,6 +326,81 @@ export function renderResolveResult(model: string, provider: string, ts: Date | 
 	return lines.join("\n");
 }
 
+/** /price resolve：解析命中链（Markdown 版，供 TUI InfoPage 排版） */
+export function renderResolveResultMarkdown(model: string, provider: string, ts: Date | undefined, filePath?: string): string {
+	const debug = resolveDebug(model, provider, ts, filePath);
+	const lines: string[] = [`# 解析 ${provider}/${model}${ts ? ` @ ${ts.toISOString()}` : " @ 当前时刻"}`, ""];
+	if (debug.chain.length === 0) {
+		lines.push("- 未找到绑定/规则（模型不存在或未绑定方案）→ **兜底价**");
+	} else {
+		lines.push("## 命中链");
+		lines.push("");
+		for (const step of debug.chain) {
+			const mark = step.matched ? "**✓ 命中**" : "✗ 未中";
+			const which = step.ruleIndex >= 0 ? `方案「${step.planName}」规则#${step.ruleIndex}` : `方案「${step.planName}」`;
+			lines.push(`- ${mark} ${which} — ${step.reason}`);
+			if (step.matched) break;
+		}
+	}
+	const live = debug.price;
+	lines.push("");
+	lines.push(`**价格**: 输出 \`${price(live.output)}\` · 输入 未缓存 \`${price(live.inputMiss)}\` / 缓存 \`${price(live.inputHit)}\`${live.isPeak ? "（高峰时段）" : ""}${debug.matched ? "" : "（兜底价，未命中任何规则）"}`);
+	lines.push("");
+	return lines.join("\n");
+}
+
+/** /price schema：v2 结构说明（Markdown 版，供 TUI InfoPage 排版） */
+export function renderSchemaMarkdown(): string {
+	return [
+		"# Schema v2 — 五注册表原子化",
+		"",
+		"文件：`~/.pi/model-pricing.json`，损坏/缺失时回退内置默认值",
+		"",
+		"## 顶层结构",
+		"",
+		"```",
+		'calendars: { "<id>": { name, dates: ["YYYY-MM-DD" | "MM-DD"] } }',
+		'prices:    { "<id>": { name, input: { miss, hit }, output } }',
+		'plans:     { "<id>": { name, rules: [ PricingRule ] } }',
+		'providers: { "<id>": { models: { "<model-id>": ModelBilling } } }',
+		"```",
+		"",
+		"## PricingRule",
+		"",
+		"```",
+		'{ "schedule": Schedule, "price": "<price-id>", "validUntil": "YYYY-MM-DD" | null }',
+		"```",
+		"",
+		"## Schedule",
+		"",
+		"```",
+		"{",
+		'  timezone,                            // 时区（默认本地）',
+		'  weekdays: [1..7],                    // 1=周一 … 7=周日',
+		'  ranges: [["HH:MM", "HH:MM") ...],    // 半开区间',
+		'  calendar?: "<id>",                   // 引用日历资源',
+		'  calendarMode?: "include" | "exclude",',
+		'  includeDates?: ["MM-DD" ...],',
+		'  excludeDates?: ["MM-DD" ...]',
+		"}",
+		"```",
+		"",
+		"## ModelBilling",
+		"",
+		"```",
+		'{ alias?, plans: [ { plan: "<plan-id>", enabled: bool } ] }',
+		"```",
+		"",
+		"## 语义",
+		"",
+		"- **数组顺序 = 优先级**：绑定顺序 / 规则顺序，first match wins",
+		"- 剔除 = 更高优先级规则直接给结果，无 exclude 规则类型",
+		'- `weekdays` 与 `ranges` 同时为空 = **永远匹配（←基准）**',
+		"- v1 文件读取时**自动迁移**为 v2",
+		"",
+	].join("\n");
+}
+
 /** /price help：命令用法（从 PRICE_SUBCOMMANDS 单一数据源派生，避免与实现漂移） */
 export function renderHelp(): string {
 	const lines: string[] = ["", "/price 模型计费（v2 五注册表原子化）", ""];
@@ -261,8 +421,35 @@ export function renderHelp(): string {
 		lines.push("");
 	}
 
-	lines.push("注: 绑定重排序只走 CLI（TUI 抽屉不提供上下移）。");
+	lines.push("注: 绑定重排入口规划中（TUI 提供启停/增删，上下移暂缺）。");
 	lines.push("注: 命名沿革 — 原 plan/price 已改名 scheme/rate（避免 /price price 重复）。");
+	return lines.join("\n");
+}
+
+/** /price help：命令参考（Markdown 版，供 TUI InfoPage 排版，仍数据驱动） */
+export function renderHelpMarkdown(): string {
+	const lines: string[] = ["# /price — 模型计费（v2 五注册表原子化）", ""];
+
+	for (const group of GROUP_ORDER) {
+		const specs = PRICE_SUBCOMMANDS.filter((s) => s.group === group);
+		if (specs.length === 0) continue;
+		lines.push(`## ${GROUP_TITLES[group]}`);
+		for (const spec of specs) {
+			lines.push(`- \`${formatUsage(spec)}\` — ${spec.summary}`);
+			// 二级动作单独列出（只列有参数提示的，避免刷屏）
+			for (const child of spec.children ?? []) {
+				if (!child.args?.length) continue;
+				const childUsage = `/price ${spec.name} ${child.name} ${child.args.map(argPlaceholder).join(" ")}`;
+				lines.push(`  - \`${childUsage}\` — ${child.summary}`);
+			}
+		}
+		lines.push("");
+	}
+
+	lines.push("---");
+	lines.push("");
+	lines.push("> 注：绑定重排入口规划中（TUI 提供启停/增删，上下移暂缺）。");
+	lines.push("> 注：命名沿革 — 原 plan/price 已改名 scheme/rate（避免 /price price 重复）。");
 	return lines.join("\n");
 }
 

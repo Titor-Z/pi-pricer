@@ -9,11 +9,12 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createJiti } from "jiti";
 
 const jiti = createJiti(import.meta.url);
-const SRC = "/Users/titor/projects/pi-pricer/src";
+const SRC = join(dirname(fileURLToPath(import.meta.url)), "..", "src");
 
 // getSettingsListTheme 依赖全局主题单例，先初始化（dark 兜底即可）
 import { initTheme } from "@earendil-works/pi-coding-agent";

@@ -32,6 +32,9 @@ const { listProviderRows, listModelRows } = await jiti.import(`${SRC}/pricing-bu
 const { PricingDrawer } = await jiti.import(`${SRC}/pricing-ui.ts`);
 const { InfoPage, MAX_INFO_LINES } = await jiti.import(`${SRC}/pricing-info-page.ts`);
 const { PricingCommands } = await jiti.import(`${SRC}/pricing-commands.ts`);
+const { PricingAgentService } = await jiti.import(`${SRC}/pricing-agent.ts`);
+const { PricingAgentTools, PRICING_AGENT_TOOL_NAMES } = await jiti.import(`${SRC}/pricing-agent-tool.ts`);
+const { PRICING_ACTION_KINDS } = await jiti.import(`${SRC}/pricing-agent-actions.ts`);
 
 function tmpDir() {
 	return mkdtempSync(join(tmpdir(), "pi-pricer-"));
@@ -607,23 +610,47 @@ test("抽屉：Enter 下钻 → 模型行 → 详情页 → Esc 返回闭环", a
 
 // ── /price 命令接线 ─────────────────────────────────────────────────────
 
-function cmdCtx({ withCustom = true } = {}) {
+function cmdCtx({ withCustom = true, confirmResult = true } = {}) {
 	const notifications = [];
 	const captured = {};
+	const confirms = [];
 	return {
+		hasUI: withCustom,
 		ui: {
 			notify: (text) => notifications.push(text),
 			custom: async (factory) => { captured.factory = factory; },
+			confirm: async (title, message) => {
+				confirms.push({ title, message });
+				return confirmResult;
+			},
 		},
 		notifications,
 		captured,
+		confirms,
 		withCustom,
 	};
 }
 
 function cmdPi() {
 	const commands = new Map();
-	return { registerCommand: (name, options) => commands.set(name, options), commands };
+	const tools = new Map();
+	// 初始就把全部内置工具视为激活（模拟 pi 默认面）
+	const active = new Set(["read", "bash", "edit", "write"]);
+	const setActiveCalls = [];
+	return {
+		registerCommand: (name, options) => commands.set(name, options),
+		registerTool: (definition) => tools.set(definition.name, definition),
+		getActiveTools: () => [...active],
+		setActiveTools: (names) => {
+			active.clear();
+			for (const name of names) active.add(name);
+			setActiveCalls.push([...names]);
+		},
+		commands,
+		tools,
+		active,
+		setActiveCalls,
+	};
 }
 
 function mountAt(path) {
@@ -1794,7 +1821,7 @@ test("v0.8 补全第 1 层：空输入返回全部一级子命令", () => {
 
 	const all = valuesOf(fn, "");
 	assert.deepEqual(all, subcommandNames(), "应返回全部子命令且顺序一致");
-	assert.equal(all.length, 6, "当前共 6 个一级子命令（v0.10 收敛后）");
+	assert.equal(all.length, 7, "当前共 7 个一级子命令（v0.12 新增 ai）");
 	// 每项都带中文说明
 	const items = fn("");
 	assert.ok(items.every((i) => typeof i.description === "string" && i.description.length > 0), "每项应有说明");
@@ -2319,5 +2346,263 @@ test("v0.11 PriceFormPage：非法价格就地报错（不离开编辑器、不�
 	out = plainOf(handle);
 	assert.ok(out.includes("价格字段"), "提交后应回到字段页");
 	assert.ok(out.includes("¥9.00"), "字段详情应显示新值 ¥9.00");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+// ── v0.12 AI 辅助配置（PricingAgentService + 工具 + /price ai）────────────
+
+/** 取已注册工具（mount 后从 mock pi 读） */
+function toolOf(pi, name) {
+	const tool = pi.tools.get(name);
+	assert.ok(tool, `工具 ${name} 应已注册`);
+	return tool;
+}
+
+/** 调用工具 execute（mock 掉 pi 注入的 ctx/onUpdate） */
+async function runTool(tool, params = {}, ctx = cmdCtx()) {
+	return tool.execute("call-1", params, undefined, undefined, ctx);
+}
+
+test("v0.12 服务：多动作应用、部分失败不中断、逐条给出原因", () => {
+	const dir = tmpDir();
+	const path = writeFixture(dir);
+	const svc = new PricingAgentService(path);
+
+	const result = svc.applyActions([
+		{ kind: "setPriceField", priceId: "peak", field: "output", value: 9.5 },
+		{ kind: "setPriceField", priceId: "nope", field: "output", value: 1 },
+		{ kind: "upsertCalendar", calendarId: "cn-holiday", name: "中国法定节假日", dates: ["01-01", "10-01"] },
+	]);
+
+	assert.equal(result.applied.length, 2, "成功 2 项");
+	assert.equal(result.errors.length, 1, "失败 1 项");
+	assert.ok(result.errors[0].reason.includes("nope"), "失败原因应点名实体");
+	assert.ok(result.applied.some((s) => s.includes("peak")), "成功项应含价格 id");
+	// 失败不中断：后续动作仍然生效
+	assert.ok(svc.getSnapshot().calendars["cn-holiday"], "失败后的动作仍应应用");
+	assert.ok(svc.isDirty, "应处于脏状态");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.12 服务：diffPreview 含改动面，commit 落盘并反映到磁盘", async () => {
+	const dir = tmpDir();
+	const path = writeFixture(dir);
+	const svc = new PricingAgentService(path);
+
+	svc.applyActions([{ kind: "setPriceField", priceId: "peak", field: "output", value: 9.5 }]);
+	const diff = svc.diffPreview();
+	assert.ok(diff.includes("价格"), "diff 应含改动面");
+	assert.ok(diff.includes("¥9.50"), "diff 应含新值");
+
+	const result = await svc.commit();
+	assert.equal(result.ok, true, "commit 应成功");
+	assert.equal(readPricing(path).prices.peak.output, 9.5, "磁盘应落新值");
+	assert.ok(!svc.isDirty, "落盘后应清脏");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.12 服务：commit 被引用保护拒绝时不落盘", async () => {
+	const dir = tmpDir();
+	const path = writeFixture(dir);
+	const svc = new PricingAgentService(path);
+
+	// 制造脏引用：方案规则指向不存在的价格（动作层不校验引用，留给 save 把关）
+	svc.applyActions([
+		{ kind: "upsertPlan", planId: "bad-plan", name: "脏引用方案", rules: [{ price: "ghost-price" }] },
+	]);
+	assert.ok(svc.isDirty, "应先进入脏状态");
+
+	const result = await svc.commit();
+	assert.equal(result.ok, false, "引用不完整应拒绝落盘");
+	assert.ok(result.reason.includes("ghost-price"), "拒绝原因应点名脏引用");
+	assert.equal(readPricing(path).plans["bad-plan"], undefined, "被拒时磁盘不应有该方案");
+	assert.ok(svc.isDirty, "被拒后改动仍保留在草稿中");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.12 服务：discard 丢弃未保存改动", () => {
+	const dir = tmpDir();
+	const path = writeFixture(dir);
+	const svc = new PricingAgentService(path);
+
+	svc.applyActions([{ kind: "setPriceField", priceId: "peak", field: "output", value: 99 }]);
+	assert.ok(svc.isDirty);
+	svc.discard();
+	assert.ok(!svc.isDirty, "discard 后应清脏");
+	assert.equal(svc.getSnapshot().prices.peak.output, 8, "应回到磁盘值");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.12 一致性：每个动作 kind 都被服务分发处理（防漂移）", () => {
+	// 构造每个 kind 的最小合法动作，断言都能得到明确结果（不与"未知 kind"同命运）
+	const samples = {
+		setPriceField: { kind: "setPriceField", priceId: "peak", field: "output", value: 1 },
+		upsertPrice: { kind: "upsertPrice", priceId: "x", name: "X", inputMiss: 1, inputHit: 1, output: 1 },
+		upsertPlan: { kind: "upsertPlan", planId: "x", name: "X", rules: [{ price: "peak" }] },
+		setRulePrice: { kind: "setRulePrice", planId: "peakworkday", ruleIndex: 0, priceId: "valley" },
+		bindModel: { kind: "bindModel", provider: "deepseek", model: "deepseek-flash", planId: "valleyalways" },
+		unbindModel: { kind: "unbindModel", provider: "deepseek", model: "deepseek-flash", planId: "valleyalways" },
+		moveBinding: { kind: "moveBinding", provider: "deepseek", model: "deepseek-flash", planId: "valleyalways", dir: "top" },
+		setAlias: { kind: "setAlias", provider: "deepseek", model: "deepseek-flash", alias: "alias-x" },
+		upsertCalendar: { kind: "upsertCalendar", calendarId: "x", name: "X", dates: ["01-01"] },
+		addCalendarDates: { kind: "addCalendarDates", calendarId: "holidays", dates: ["02-02"] },
+	};
+	assert.deepEqual(Object.keys(samples).sort(), [...PRICING_ACTION_KINDS].sort(), "样本应覆盖全部 kind");
+
+	for (const kind of PRICING_ACTION_KINDS) {
+		const dir = tmpDir();
+		const path = writeFixture(dir);
+		const svc = new PricingAgentService(path);
+		const result = svc.applyActions([samples[kind]]);
+		assert.equal(result.outcomes.length, 1, `${kind} 应有处理结果`);
+		assert.equal(result.outcomes[0].kind, kind, `${kind} 结果应标记 kind`);
+		assert.notEqual(result.outcomes[0].reason, "未知动作类型", `${kind} 不应落入未知分支`);
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("v0.12 工具：未启用时全部返回指引而不是抛错", async () => {
+	const tools = new PricingAgentTools();
+	const pi = cmdPi();
+	tools.register(pi);
+	for (const name of PRICING_AGENT_TOOL_NAMES) {
+		const result = await runTool(toolOf(pi, name));
+		assert.ok(result.content[0].text.includes("未启用"), `${name} 未启用应给指引`);
+	}
+});
+
+test("v0.12 工具：price_apply → price_review → price_save 闭环落盘", async () => {
+	const dir = tmpDir();
+	const path = writeFixture(dir);
+	const tools = new PricingAgentTools(path);
+	const pi = cmdPi();
+	tools.register(pi);
+	tools.enable();
+
+	const applied = await runTool(toolOf(pi, "price_apply"), {
+		actions: [{ kind: "setPriceField", priceId: "peak", field: "output", value: 7.5 }],
+	});
+	assert.ok(applied.content[0].text.includes("已应用到内存草稿"), "apply 应报告成功");
+	assert.ok(applied.content[0].text.includes("price_review"), "apply 应引导下一步");
+
+	const reviewed = await runTool(toolOf(pi, "price_review"));
+	assert.ok(reviewed.content[0].text.includes("¥7.50"), "review 应展示新值");
+
+	const saved = await runTool(toolOf(pi, "price_save"), {}, cmdCtx());
+	assert.ok(saved.content[0].text.includes("已保存"), "save 应成功");
+	assert.equal(readPricing(path).prices.peak.output, 7.5, "磁盘应落新值");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.12 工具：price_save 首次弹确认；用户取消则不落盘", async () => {
+	const dir = tmpDir();
+	const path = writeFixture(dir);
+	const tools = new PricingAgentTools(path);
+	const pi = cmdPi();
+	tools.register(pi);
+	tools.enable();
+	await runTool(toolOf(pi, "price_apply"), {
+		actions: [{ kind: "setPriceField", priceId: "peak", field: "output", value: 7.5 }],
+	});
+
+	const ctx = cmdCtx({ confirmResult: false });
+	const saved = await runTool(toolOf(pi, "price_save"), {}, ctx);
+	assert.equal(ctx.confirms.length, 1, "首次保存应弹一次确认");
+	assert.ok(saved.content[0].text.includes("取消"), "取消应如实反馈");
+	assert.equal(readPricing(path).prices.peak.output, 8, "取消不落盘");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.12 工具：确认过一次后同一会话内不再弹确认", async () => {
+	const dir = tmpDir();
+	const path = writeFixture(dir);
+	const tools = new PricingAgentTools(path);
+	const pi = cmdPi();
+	tools.register(pi);
+	tools.enable();
+
+	// 第一次保存（确认）
+	await runTool(toolOf(pi, "price_apply"), { actions: [{ kind: "setPriceField", priceId: "peak", field: "output", value: 6 }] });
+	const ctx1 = cmdCtx();
+	await runTool(toolOf(pi, "price_save"), {}, ctx1);
+	assert.equal(ctx1.confirms.length, 1, "第一次应弹确认");
+
+	// 第二次保存（不再确认）
+	await runTool(toolOf(pi, "price_apply"), { actions: [{ kind: "setPriceField", priceId: "peak", field: "output", value: 5 }] });
+	const ctx2 = cmdCtx();
+	await runTool(toolOf(pi, "price_save"), {}, ctx2);
+	assert.equal(ctx2.confirms.length, 0, "第二次不应再弹确认");
+	assert.equal(readPricing(path).prices.peak.output, 5, "第二次应直接落盘");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.12 工具：price_discard 清空草稿", async () => {
+	const dir = tmpDir();
+	const path = writeFixture(dir);
+	const tools = new PricingAgentTools(path);
+	const pi = cmdPi();
+	tools.register(pi);
+	tools.enable();
+	await runTool(toolOf(pi, "price_apply"), { actions: [{ kind: "setPriceField", priceId: "peak", field: "output", value: 99 }] });
+
+	const result = await runTool(toolOf(pi, "price_discard"));
+	assert.ok(result.content[0].text.includes("丢弃"), "discard 应反馈");
+	const save = await runTool(toolOf(pi, "price_save"), {}, cmdCtx());
+	assert.ok(save.content[0].text.includes("没有未保存"), "discard 后应无改动可存");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.12 /price ai：启用后 price_* 进入 active tools；off 后移除", async () => {
+	const dir = tmpDir();
+	const path = writeFixture(dir);
+	const { pi, handler } = mountAt(path);
+	const ctx = cmdCtx();
+
+	// 初始未激活
+	assert.ok(!pi.active.has("price_apply"), "初始不应激活 price_apply");
+
+	await handler("ai", ctx);
+	assert.equal(ctx.confirms.length, 1, "启用应先征求同意");
+	for (const name of PRICING_AGENT_TOOL_NAMES) {
+		assert.ok(pi.active.has(name), `启用后应激活 ${name}`);
+	}
+
+	await handler("ai off", ctx);
+	for (const name of PRICING_AGENT_TOOL_NAMES) {
+		assert.ok(!pi.active.has(name), `停用后应移除 ${name}`);
+	}
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.12 /price ai：用户拒绝启用则不激活任何工具", async () => {
+	const dir = tmpDir();
+	const path = writeFixture(dir);
+	const { pi, handler } = mountAt(path);
+	const ctx = cmdCtx({ confirmResult: false });
+
+	await handler("ai", ctx);
+	assert.ok(!pi.active.has("price_apply"), "拒绝后不应激活");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.12 /price ai：headless 不支持并给出提示", async () => {
+	const dir = tmpDir();
+	const path = writeFixture(dir);
+	const { pi, handler } = mountAt(path);
+	const ctx = cmdCtx({ withCustom: false });
+
+	await handler("ai", ctx);
+	assert.ok(ctx.notifications.some((n) => n.includes("需要交互式界面")), "headless 应提示不支持");
+	assert.ok(!pi.active.has("price_apply"), "headless 不应激活");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.12 /price ai：未启用时服务层未创建，工具调用返回指引", async () => {
+	const dir = tmpDir();
+	const path = writeFixture(dir);
+	const { pi } = mountAt(path);
+	const result = await runTool(toolOf(pi, "price_get"));
+	assert.ok(result.content[0].text.includes("未启用"), "未启用应给指引");
+	assert.ok(result.content[0].text.includes("/price ai"), "指引应点名启用命令");
 	rmSync(dir, { recursive: true, force: true });
 });

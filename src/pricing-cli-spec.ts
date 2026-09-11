@@ -90,6 +90,15 @@ export const PRICE_SUBCOMMANDS: SubcommandSpec[] = [
 		],
 	},
 	{
+		name: "ai",
+		summary: "AI 辅助配置：本次会话内允许 agent 修改计费配置（需确认后落盘）",
+		group: "manage",
+		children: [
+			{ name: "on", summary: "启用 AI 编辑模式（默认行为，可省略）" },
+			{ name: "off", summary: "停用 AI 编辑模式" },
+		],
+	},
+	{
 		name: "help",
 		summary: "显示本帮助（含 schema 说明）",
 		group: "debug",

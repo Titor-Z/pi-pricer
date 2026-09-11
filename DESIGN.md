@@ -201,6 +201,35 @@ Pi 生态的模型计费数据共享中心。解决"厂商调价频繁，硬编�
 `mdHeading` / `mdLink` / `mdCode` / `mdCodeBlock` / `mdQuote` / `mdListBullet`，
 不自定义 hex。
 
+### AI 辅助配置（/price ai）
+
+编辑面有两种入口，共用同一套 `PricingDraft` 与引用保护：
+
+| | 人工（抽屉） | AI（`/price ai`） |
+|---|---|---|
+| 触发 | 用户按键 | 用户给价格资料，agent 解析 |
+| 写入 | 逐字段改内存 | 结构化语义动作批量应用 |
+| 落盘 | `Ctrl+S` | `price_save`（首次弹确认） |
+| 校验 | `save()` 的 validate + 引用保护 | 同左（同一 draft） |
+
+**为何要显式开关**：工具的 description 再好，模型也可能在用户只是"问价"时顺手改配置。
+因此工具"注册但不激活"——`/price ai` 前，`price_*` 不在 active tools 里，
+模型在系统提示里根本看不到它们。这是能力层的隔离，不是文案约定。
+
+**为何用 draft 而不是直接写文件**：agent 最坏情况下也只能提交一个
+"结构合法但语义不对"的配置，且落盘前会被引用完整性拦住；
+而让 agent 自己 `edit` JSON 会把文件写成什么都有可能。skill 里写死禁止直接改文件。
+
+**确认粒度**：`/price ai` 本身已在启用前确认过一次（会话级授权）；
+首次 `price_save` 再弹一次 diff 确认作为安全阀；同一会话内之后不再打扰。
+
+**动作与能力对应**：`setPriceField` / `upsertPrice` / `upsertPlan` / `setRulePrice` /
+`bindModel` / `unbindModel` / `moveBinding` / `setAlias` / `upsertCalendar` /
+`addCalendarDates` —— 每个 kind 对应一个 draft mutator，
+一致性测试遍历 `PRICING_ACTION_KINDS` 断言无遗漏分支。
+
+---
+
 ### 临时页栈（pageStack）与输入覆盖层（overlay）
 
 两套临时层分工明确、**互斥**：
@@ -518,11 +547,29 @@ resolvePricing(model, provider, ts)
   抽屉 `PricingDrawer`（消费 PricingDraft + builder 行构建可编辑 SettingsList +
   ActionMenu 动作页，filePath 注入可测，不访问 ExtensionAPI）。
 
+- **AI 辅助层（pricing-agent-actions / pricing-agent / pricing-agent-tool）**：
+  `PricingAgentService` —— 把**语义动作**作用到 `PricingDraft` 内存态，
+  提供 `getSummary()` / `applyActions()` / `diffPreview()` / `commit()` / `discard()`。
+  动作 schema（`PricingActionSchema`，typebox 判别联合）与 draft mutator 一一对应，
+  与分发 switch 共用 `PRICING_ACTION_KINDS` 防漂移。
+  `PricingAgentTools` 把服务包成 `price_get` / `price_apply` / `price_review` /
+  `price_save` / `price_discard` **注册但不激活**的工具；`/price ai` 才
+  `setActiveTools` 加入激活集，未启用时模型看不到也调不到。
+  落盘走 `withFileMutationQueue`，与内置 `edit`/`write` 共享同一文件队列。
+  安全边界：agent 只能提交结构化动作，不能整份覆盖 JSON；引用合法性由
+  `PricingDraft.validate()` 在落盘前统一把关。
+
+- **内置 Skill（skills/price-config）**：
+  教 agent 工作流（读现状 → 解析资料 → 补缺失信息 → 应用动作 → 让用户确认 → 落盘），
+  并写死硬性禁止：不得用 `edit`/`write` 直接改 `model-pricing.json`，不得猜数值。
+  由 pi 的包内 skill 自动发现（`skills/` 目录），随 npm 包分发。
+
 - **接线层（pricing-commands）**：
   PricingCommands.mount(pi) 注册 `/price` 命令，无参 → drawer.open(ctx)（headless
-  返回 false → 回退 /price list 文本）；子命令 list/model/plan/price/calendar/
-  resolve/bind/unbind/move/schema 全部经注入 filePath 读写，首次启动 seedPricing。
-  DI 可测。
+  返回 false → 回退 /price list 文本）；子命令 model/list/scheme/rate/calendar/ai/help
+  全部经注入 filePath 读写，首次启动 seedPricing。
+  `/price ai [on|off]` 管理 AI 编辑模式（启用前确认 → 激活 price_* 工具；
+  停用 → 移除）。DI 可测。
 
 ## Do's and Don'ts
 
@@ -538,6 +585,11 @@ resolvePricing(model, provider, ts)
 - Do "首次提示、再次确认"的守卫（如 Esc 退出）必须带已提示状态位
 - Do 每个 submenu 的关闭路径统一走一个 `finish()`，避免双重关闭
 - Do 让 `/price list` 在 headless 模式下回退为文本输出；TUI 下 list/model/scheme/rate/calendar/help 均走 InfoPage 只读页
+- Do agent 改配置只走 `price_apply`（语义动作）+ `price_save`，复用 `PricingDraft` 的 validate 与引用保护
+- Do AI 工具"注册但不激活"，由 `/price ai` 显式启用后 `setActiveTools` 加入（安全性靠能力隔离而非文案）
+- Do 新增动作 kind 时同步 `PricingActionSchema` 与 `PRICING_ACTION_KINDS`（一致性测试会拦漏分发）
+- Do 自定义工具写文件走 `withFileMutationQueue`（与内置 edit/write 共享文件队列）
+- Do 新增包内资源（skills 等）时同步 `package.json` 的 `pi` key 与 `files` 白名单，否则 npm 包不含该资源
 - Don't 用 SettingsList 做"执行动作"（普通项 Enter 是空操作）——用 `submenu` 或 ActionMenu
 - Don't 在抽屉子菜单内期待顶层快捷键生效（子菜单会接管输入）
 - Don't 在 SettingsList 里循环价格值（精确数值不适合离散循环）
@@ -548,3 +600,5 @@ resolvePricing(model, provider, ts)
 - Don't 给输入弹窗传空 `onCancel`（会导致 Esc 卡屏）——必须接 handle 且 onSubmit/onCancel 都 hide+dispose
 - Don't 丢弃 `showOverlay` 的返回值（拿不到 handle 就无法关闭）
 - Don't 为每个厂商硬编码峰时段逻辑（数据驱动：calendars/plans/rules 定义一切）
+- Don't 在 skill 或工具描述里暗示 agent 可以直接编辑 `model-pricing.json`（会绕过引用保护）
+- Don't 让工具在未启用时抛错（异常会中断 agent 回合）——应返回可执行的指引文本

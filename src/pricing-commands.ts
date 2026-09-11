@@ -19,6 +19,7 @@ import {
 } from "./pricing-format.ts";
 import { PricingDrawer, isValidCalendarDate } from "./pricing-ui.ts";
 import { PRICE_SUBCOMMANDS, findSubcommand, PRICE_FIELDS } from "./pricing-cli-spec.ts";
+import { PricingAgentTools, PRICING_AGENT_TOOL_NAMES } from "./pricing-agent-tool.ts";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import type { PricingSchema } from "./pricing-types.ts";
 
@@ -48,19 +49,26 @@ function setPriceField(p: { input: { miss: number; hit: number }; output: number
 export class PricingCommands {
 	private readonly drawer: PricingDrawer;
 
+	/** AI 辅助配置工具集（注册但不激活，/price ai 才启用） */
+	private readonly agentTools: PricingAgentTools;
+
 	/** filePath 注入便于单测隔离（默认读 ~/.pi/model-pricing.json） */
 	private readonly filePath?: string;
 
 	constructor(filePath?: string) {
 		this.filePath = filePath;
 		this.drawer = new PricingDrawer(filePath);
+		this.agentTools = new PricingAgentTools(filePath);
 	}
 
 	mount(pi: ExtensionAPI): void {
 		seedPricing(this.filePath);
 
+		// 工具先注册（此时未激活，模型看不到也调不到；/price ai 才加入 active tools）
+		this.agentTools.register(pi);
+
 		pi.registerCommand("price", {
-			description: "模型计费（v2 五注册表）：无参开抽屉 | model|list|scheme|rate|calendar|help",
+			description: "模型计费（v2 五注册表）：无参开抽屉 | model|list|scheme|rate|calendar|ai|help",
 			// pi 只认这个字段生成扩展命令的参数补全（扩展无法设 argumentHint）
 			getArgumentCompletions: (prefix: string) => this.completeArguments(prefix),
 			handler: async (args: string, ctx: ExtensionCommandContext) => {
@@ -100,6 +108,9 @@ export class PricingCommands {
 						// TUI 下直达日历管理页；headless 回退文本
 						if (await this.drawer.open(ctx, "calendar")) break;
 						this.calendarOp(parts[1], parts[2], parts[3], parts.slice(4), ctx);
+						break;
+					case "ai":
+						await this.aiOp(parts[1], pi, ctx);
 						break;
 					default:
 						ctx.ui.notify(renderHelp(), "info");
@@ -237,6 +248,61 @@ export class PricingCommands {
 		// TUI 下以 Markdown 详情只读页呈现（InfoPage）；headless 回退纯文本
 		if (await this.drawer.open(ctx, "model", { provider, model })) return;
 		ctx.ui.notify(renderModelDetail(provider, model, this.filePath), "info");
+	}
+
+	/**
+	 * /price ai [on|off]：显式启用/停用 AI 编辑模式（会话级）。
+	 *
+	 * 启用 = 把 price_* 加入 active tools（未启用时模型看不到也调不到）；
+	 * 停用 = 从 active tools 移除并清空服务实例。
+	 */
+	private async aiOp(action: string | undefined, pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
+		switch (action) {
+			case "off":
+				this.disableAgent(pi, ctx);
+				break;
+			case "on":
+			case undefined:
+				await this.enableAgent(pi, ctx);
+				break;
+			default:
+				ctx.ui.notify("用法: /price ai [on|off]", "info");
+		}
+	}
+
+	/** 启用 AI 编辑模式：先征得用户同意，再激活工具 */
+	private async enableAgent(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
+		if (!ctx.hasUI) {
+			ctx.ui.notify("AI 编辑模式需要交互式界面（TUI），当前环境不支持。", "warning");
+			return;
+		}
+		if (this.agentTools.enabled) {
+			ctx.ui.notify("AI 编辑模式已启用。让 agent 读取价格文档并帮你修改即可；/price ai off 可停用。", "info");
+			return;
+		}
+		const ok = await ctx.ui.confirm(
+			"启用 AI 编辑模式",
+			`本次会话内允许 agent 修改计费配置（${this.filePath ?? "~/.pi/model-pricing.json"}）。\n\n所有改动先进内存草稿，首次落盘前会再次向你确认。`,
+		);
+		if (!ok) {
+			ctx.ui.notify("已取消，未启用 AI 编辑模式。", "info");
+			return;
+		}
+		this.agentTools.enable();
+		pi.setActiveTools([...new Set([...pi.getActiveTools(), ...PRICING_AGENT_TOOL_NAMES])]);
+		ctx.ui.notify("AI 编辑模式已启用。现在可以让 agent 读取价格文档并修改配置。", "info");
+	}
+
+	/** 停用 AI 编辑模式：移除工具并清空服务实例 */
+	private disableAgent(pi: ExtensionAPI, ctx: ExtensionCommandContext): void {
+		if (!this.agentTools.enabled) {
+			ctx.ui.notify("AI 编辑模式未启用。", "info");
+			return;
+		}
+		this.agentTools.disable();
+		const remove = new Set<string>(PRICING_AGENT_TOOL_NAMES);
+		pi.setActiveTools(pi.getActiveTools().filter((name) => !remove.has(name)));
+		ctx.ui.notify("AI 编辑模式已停用（未保存的草稿已丢弃）。", "info");
 	}
 
 	/** /price scheme [<id>] | scheme create <id> <name> | scheme duplicate <id> | scheme delete <id> */

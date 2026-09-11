@@ -10,13 +10,13 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createJiti } from "/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/jiti/lib/jiti.mjs";
+import { createJiti } from "jiti";
 
 const jiti = createJiti(import.meta.url);
 const SRC = "/Users/titor/projects/pi-pricer/src";
 
 // getSettingsListTheme 依赖全局主题单例，先初始化（dark 兜底即可）
-const { initTheme } = await jiti.import("/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/dist/index.js");
+import { initTheme } from "@earendil-works/pi-coding-agent";
 initTheme("dark");
 
 const { readPricing, writePricing, seedPricing, updatePricing, migrateV1ToV2, checkPlanDeletable, checkPriceDeletable } = await jiti.import(`${SRC}/pricing-store.ts`);

@@ -19,6 +19,14 @@ components:
     shellBorder: "{colors.border-accent}"
     titleText: "{colors.accent}"
     titleWeight: bold
+  command-completion:
+    # 渲染归属：pi-tui 的 Editor + SelectList（pi-pricer 只提供候选数据，不自绘）
+    renderer: pi-tui Editor / SelectList
+    selectedPrefix: "{colors.accent}"
+    selectedText: "{colors.accent}"
+    description: "{colors.dim}"
+    scrollInfo: "{colors.dim}"
+    noMatch: "{colors.dim}"
 ---
 
 # pi-pricer Model Pricing Config
@@ -123,6 +131,45 @@ Pi 生态的模型计费数据共享中心。解决"厂商调价频繁，硬编�
 （绑定启停、方案操作、价格字段、删除确认、新建输入）改用 `ActionMenu` 自绘菜单
 （↑↓ 选择 / Enter 执行 / Esc 返回），行为可预期。
 
+### Command Completion（命令参数补全）
+
+> **渲染归属**：候选菜单由 **pi-tui 的 `Editor` + `SelectList`** 绘制（`editor.ts` 的
+> `createAutocompleteList()`，使用 `SelectListTheme`）。pi-pricer **不自绘菜单**，
+> 只实现 `getArgumentCompletions` 提供候选数据（`AutocompleteItem`）。
+> 因此本节的颜色/布局均为 pi-tui 的，不是本项目的定制点。
+
+**视觉示意**（`/price scheme` 后）：
+
+```
+  /price scheme
+  ┌──────────────────────────────────────────────┐
+  │ → create       新建方案（默认挂首个价格实体）  │   ← 选中行：accent + → 前缀
+  │   duplicate    复制方案                       │
+  │   delete       删除方案（被绑定时拒绝）        │
+  └──────────────────────────────────────────────┘
+```
+
+**一行候选的结构**：`<selectedPrefix><label>` 左列 + `description` 右列，两列对齐；
+未选中行无前缀。颜色 token 见 frontmatter 的 `command-completion`。
+
+**候选行数**：由 pi-tui 的 `autocompleteMaxVisible` 限制，超出时显示滚动信息
+（`scrollInfo`）；无候选时**不出现菜单**（不显示空壳）。
+
+**触发与选中**：
+- 在 `/price` 后输入空格触发；继续输入按前缀过滤（忽略大小写）
+- `Tab` 或 `Enter` 选中；选中后当前 token 被替换为 `item.value`
+- 高亮优先：精确匹配 > 前缀匹配 > 保持默认高亮（pi-tui `editor.ts` 的行为）
+
+**候选文案规范**（新增子命令必须遵守）：
+
+| 位置 | label | description | 例 |
+|---|---|---|---|
+| 一级子命令 | 子命令名 | 中文一句话说明（尽量 ≤ 20 字） | `scheme` / 方案管理：列表 / 详情 / 新建 / 复制 / 删除 |
+| 二级动作 | 动作名 | 中文一句话说明 | `delete` / 删除方案（被绑定时拒绝） |
+| 动态 id | 真实 id | 其显示名（或 `provider/model` 上下文） | `valleyalways` / 全时谷价 |
+
+> 设计意图：用户**不用记 id**，也不用离开输入框查看配置；每一行都能自证含义。
+
 ### 临时页栈（pageStack）与输入覆盖层（overlay）
 
 两套临时层分工明确、**互斥**：
@@ -224,8 +271,9 @@ ActionMenu 之上而不丢失菜单上下文；因此引入 `pageStack`：顶层
 
 ### 命令补全（getArgumentCompletions）
 
-pi 为扩展命令生成候选**只读 `getArgumentCompletions`**；扩展无法设 `argumentHint`。
+**外观与文案规范见 `## Components → Command Completion`**；本节只描述行为契约。
 
+pi 为扩展命令生成候选**只读 `getArgumentCompletions`**；扩展无法设 `argumentHint`。
 分层规则（`pricing-cli-spec.ts` 的 `args` 声明决定每列语义）：
 
 | 已输入 | 候选 |
@@ -234,10 +282,15 @@ pi 为扩展命令生成候选**只读 `getArgumentCompletions`**；扩展无法
 | 第 2 列 | 二级动作（scheme/rate/calendar/move） |
 | 第 3+ 列 | 按位置语义读配置取真实 id：provider / model / plan / price / calendar / field / direction |
 
-- 例：`scheme delete ` → 方案 id；`bind deepseek deepseek-flash ` → 该模型已绑定方案；
-  `move … peakworkday ` → up/down/top/bottom
-- 「末尾是否有空格」决定补当前 token 还是开新 token
-- 动态读取异常一律 try/catch 降级，绝不抛出（补全异常会破坏输入框）
+行为示例：
+- `scheme delete ` → 方案 id（`peakworkday` / `valleyalways` / …）
+- `bind deepseek deepseek-flash ` → **该模型已绑定**的宏方案优先
+- `rate set peak ` → `input.miss` / `input.hit` / `output`
+- `move … peakworkday ` → `up` / `down` / `top` / `bottom`
+
+边界约定：
+- 「末尾是否有空格」决定补当前 token 还是开新 token（最易写错处）
+- 动态读取异常一律 try/catch 降级，**绝不抛出**（补全异常会破坏输入框）
 - 无匹配返回 `null`（pi 约定）
 - 单一数据源：dispatch / help / 补全三处同源，配一致性测试防漂移
 
@@ -405,6 +458,9 @@ resolvePricing(model, provider, ts)
 - Do 所有抽屉编辑先写 `PricingDraft`，Ctrl+S 才落盘
 - Do 删除类操作一律经引用保护（`validate()` 的 checkBindings / checkPlans）
 - Do 用显式深度计数器（`depth`）判断当前层级，**不要用标题等展示层状态反推**
+- Do 补全项的 `description` 必须非空（一致性测试会拦）
+- Do 动态 id 项的 description 用其显示名（如方案名），便于用户确认再选中
+- Do 新增子命令时同步 `pricing-cli-spec.ts`（单一数据源），补全/help/dispatch 自动跟进
 - Do "首次提示、再次确认"的守卫（如 Esc 退出）必须带已提示状态位
 - Do 每个 submenu 的关闭路径统一走一个 `finish()`，避免双重关闭
 - Do 让 `/price list` 在 headless 模式下回退为文本输出，且每个编辑能力都有 CLI 等价命令
@@ -413,6 +469,8 @@ resolvePricing(model, provider, ts)
 - Don't 在 SettingsList 里循环价格值（精确数值不适合离散循环）
 - Don't 让 store/draft 层依赖 ExtensionAPI（纯函数可独立测试）
 - Don't 在格式化层做 JSON 读写（只渲染，不 IO）
+- Don't 自绘补全菜单：渲染归 pi-tui（`Editor` + `SelectList`），本项目只提供候选数据
+- Don't 在补全回调里做重 IO 或抛错（异常必须降级为静态候选/null）
 - Don't 给 `ExtensionInputComponent` 传空 `onCancel`（会导致 Esc 卡屏）
 - Don't 丢弃 `showOverlay` 的返回值（拿不到 handle 就无法关闭）
 - Don't 为每个厂商硬编码峰时段逻辑（数据驱动：calendars/plans/rules 定义一切）

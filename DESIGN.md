@@ -222,6 +222,25 @@ Ctrl+R → reset() 重新 readPricing，清空 changed
 ActionMenu 之上而不丢失菜单上下文；因此引入 `pageStack`：顶层输入优先派发给
 栈顶，栈顶 Esc 出栈回到 ActionMenu。
 
+### 命令补全（getArgumentCompletions）
+
+pi 为扩展命令生成候选**只读 `getArgumentCompletions`**；扩展无法设 `argumentHint`。
+
+分层规则（`pricing-cli-spec.ts` 的 `args` 声明决定每列语义）：
+
+| 已输入 | 候选 |
+|---|---|
+| 第 1 列 | 一级子命令（`PRICE_SUBCOMMANDS`，带中文说明） |
+| 第 2 列 | 二级动作（scheme/rate/calendar/move） |
+| 第 3+ 列 | 按位置语义读配置取真实 id：provider / model / plan / price / calendar / field / direction |
+
+- 例：`scheme delete ` → 方案 id；`bind deepseek deepseek-flash ` → 该模型已绑定方案；
+  `move … peakworkday ` → up/down/top/bottom
+- 「末尾是否有空格」决定补当前 token 还是开新 token
+- 动态读取异常一律 try/catch 降级，绝不抛出（补全异常会破坏输入框）
+- 无匹配返回 `null`（pi 约定）
+- 单一数据源：dispatch / help / 补全三处同源，配一致性测试防漂移
+
 ### 无 TUI 回退
 
 headless 模式下 `/price` 回退为 `list` 文本输出；所有编辑能力均有等价 CLI

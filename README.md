@@ -42,6 +42,9 @@ npm install file:../pi-pricer
 | `/price schema` | Schema 格式说明 |
 | `/price help` | 帮助 |
 
+> 命令支持 **Tab 补全**：`/price` 后按 Tab 列出子命令，继续输入可补二级动作与
+> 配置中真实存在的方案/价格/日历/模型 id。
+
 ## 数据文件
 
 `~/.pi/model-pricing.json`（首次启动自动写入内置默认值）。

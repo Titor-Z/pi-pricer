@@ -621,13 +621,22 @@ function mountAt(path) {
 	return { pi, handler: pi.commands.get("price").handler };
 }
 
-test("挂载：/price 无参 TUI 开抽屉；headless 回退文本总览", async () => {
+test("挂载：/price 无参 TUI 开抽屉（渲染厂商列表）；headless 回退文本总览", async () => {
 	const dir = tmpDir();
 	const path = writeFixture(dir);
 	const { handler } = mountAt(path);
 	const tui = cmdCtx({ withCustom: true });
 	await handler("", tui);
 	assert.ok(tui.captured.factory, "TUI 开抽屉");
+
+	// 加固：不只断言工厂被调用，还要断言抽屉真的渲染出厂商列表
+	// （v0.8 前这里只断言 captured.factory 存在，属假阳性，漏掉了"根层渲染为空"这类缺陷）
+	const out = plainOf(runDrawer(tui.captured));
+	assert.ok(out.includes("模型计费配置 · 厂商"), "抽屉标题应为厂商层");
+	assert.ok(out.includes("deepseek"), "抽屉应渲染出 deepseek 厂商行");
+	assert.ok(out.includes("glm"), "抽屉应渲染出 glm 厂商行");
+	assert.ok(!out.includes("方案注册表"), "根层不应含注册表项（v0.7 起收敛为仅模型）");
+
 	const headless = cmdCtx({ withCustom: false });
 	headless.ui = { notify: headless.ui.notify };
 	await handler("", headless);
@@ -1670,4 +1679,157 @@ test("v0.7 CLI calendar add 拒绝不存在的日期", async () => {
 	await handler("calendar add ok 好日期 04-31", ctx);
 	assert.ok(ctx.notifications.at(-1).includes("无效日期"), "应拒绝 4 月 31 日");
 	rmSync(dir, { recursive: true, force: true });
+});
+
+// ── v0.8 命令参数补全（getArgumentCompletions）──────────────────────────
+
+const { PRICE_SUBCOMMANDS, subcommandNames, findSubcommand } = await jiti.import(`${SRC}/pricing-cli-spec.ts`);
+
+/** 取 /price 的补全函数（mount 后从注册表读取） */
+function completionsAt(path) {
+	const { pi } = mountAt(path);
+	return pi.commands.get("price").getArgumentCompletions;
+}
+
+/** 补全结果的值列表（null → null，便于断言"无建议"） */
+function valuesOf(fn, input) {
+	const items = fn(input);
+	return items === null || items === undefined ? null : items.map((i) => i.value);
+}
+
+test("v0.8 补全第 1 层：空输入返回全部一级子命令", () => {
+	const dir = tmpDir();
+	const path = writeFixture(dir);
+	const fn = completionsAt(path);
+
+	const all = valuesOf(fn, "");
+	assert.deepEqual(all, subcommandNames(), "应返回全部子命令且顺序一致");
+	assert.equal(all.length, 11, "当前共 11 个一级子命令");
+	// 每项都带中文说明
+	const items = fn("");
+	assert.ok(items.every((i) => typeof i.description === "string" && i.description.length > 0), "每项应有说明");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.8 补全第 1 层：前缀过滤", () => {
+	const dir = tmpDir();
+	const path = writeFixture(dir);
+	const fn = completionsAt(path);
+
+	assert.deepEqual(valuesOf(fn, "sch"), ["scheme", "schema"]);
+	assert.deepEqual(valuesOf(fn, "r"), ["rate", "resolve"]);
+	assert.deepEqual(valuesOf(fn, "cal"), ["calendar"]);
+	assert.equal(valuesOf(fn, "zzz"), null, "无匹配应返回 null（pi 约定）");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.8 补全第 2 层：二级动作", () => {
+	const dir = tmpDir();
+	const path = writeFixture(dir);
+	const fn = completionsAt(path);
+
+	assert.deepEqual(valuesOf(fn, "scheme "), ["create", "duplicate", "delete"]);
+	assert.deepEqual(valuesOf(fn, "scheme d"), ["duplicate", "delete"]);
+	assert.deepEqual(valuesOf(fn, "rate "), ["create", "set", "delete"]);
+	assert.deepEqual(valuesOf(fn, "calendar "), ["add", "remove"]);
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.8 补全第 3 层：动态 id（来自当前配置）", () => {
+	const dir = tmpDir();
+	const path = writeFixture(dir);
+	const fn = completionsAt(path);
+
+	assert.deepEqual(valuesOf(fn, "scheme delete "), ["peakworkday", "valleyalways", "glmalways"], "应列出方案 id");
+	assert.deepEqual(valuesOf(fn, "scheme duplicate v"), ["valleyalways"], "前缀过滤方案 id");
+	assert.deepEqual(valuesOf(fn, "rate delete "), ["peak", "valley", "glm"], "应列出价格 id");
+	assert.deepEqual(valuesOf(fn, "rate set "), ["peak", "valley", "glm"], "rate set 第 2 列是价格 id");
+	assert.deepEqual(valuesOf(fn, "rate set peak "), ["input.miss", "input.hit", "output"], "rate set 第 3 列是字段");
+	assert.deepEqual(valuesOf(fn, "calendar remove "), ["holidays"], "应列出日历 id");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.8 补全：provider / model / plan 逐列递进", () => {
+	const dir = tmpDir();
+	const path = writeFixture(dir);
+	const fn = completionsAt(path);
+
+	assert.deepEqual(valuesOf(fn, "model "), ["deepseek", "glm"], "model 第 1 列是 provider");
+	assert.deepEqual(valuesOf(fn, "model deepseek "), ["deepseek-flash"], "model 第 2 列限定该 provider 的模型");
+	assert.deepEqual(valuesOf(fn, "bind "), ["deepseek", "glm"]);
+	assert.deepEqual(valuesOf(fn, "bind deepseek "), ["deepseek-flash"]);
+	assert.deepEqual(valuesOf(fn, "bind deepseek deepseek-flash "), ["peakworkday", "valleyalways"], "已绑定方案优先");
+	// resolve 的位置语义是 <model> [provider] [ts]
+	assert.deepEqual(valuesOf(fn, "resolve "), ["deepseek-flash", "glm-5.3-flash"], "resolve 第 1 列是模型");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.8 补全：move 方向为第 4 列", () => {
+	const dir = tmpDir();
+	const path = writeFixture(dir);
+	const fn = completionsAt(path);
+
+	assert.deepEqual(valuesOf(fn, "move deepseek deepseek-flash peakworkday "), ["up", "down", "top", "bottom"]);
+	assert.deepEqual(valuesOf(fn, "move deepseek deepseek-flash peakworkday u"), ["up"]);
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.8 补全：无位置参数的子命令不补", () => {
+	const dir = tmpDir();
+	const path = writeFixture(dir);
+	const fn = completionsAt(path);
+
+	assert.equal(valuesOf(fn, "list "), null);
+	assert.equal(valuesOf(fn, "schema "), null);
+	assert.equal(valuesOf(fn, "help "), null);
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.8 补全：配置损坏时不抛错且降级为一级子命令", () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writeFileSync(path, "{ 这不是合法 JSON", "utf8");
+	const fn = completionsAt(path);
+
+	// 一级补全走静态数据，仍应可用
+	assert.deepEqual(valuesOf(fn, ""), subcommandNames(), "损坏时一级补全仍应可用");
+	// 动态层读文件失败：不得抛错（readPricing 有兜底，返回默认值）
+	const dynamic = valuesOf(fn, "scheme delete ");
+	assert.ok(Array.isArray(dynamic), "动态层应有兜底而非抛错");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.8 一致性：补全列出的每个子命令都被 dispatch 识别", async () => {
+	const dir = tmpDir();
+	const path = writeFixture(dir);
+	const { handler } = mountAt(path);
+	const ctx = cmdCtx({ withCustom: false });
+	ctx.ui = { notify: ctx.ui.notify };
+
+	for (const name of subcommandNames()) {
+		ctx.notifications.length = 0;
+		await handler(name, ctx);
+		const last = ctx.notifications.at(-1) ?? "";
+		// help 本身以 help 文本为正确输出，不能据此判定"未识别"
+		if (name === "help") {
+			assert.ok(last.includes("/price 模型计费"), "help 应输出帮助");
+			continue;
+		}
+		// 其余子命令：即便参数不足也应给出列表/usage，而不是整篇 help
+		const fellThroughToHelp = last.trimStart().startsWith("/price 模型计费");
+		assert.ok(!fellThroughToHelp, `子命令 "${name}" 已被补全列出，但 dispatch 未识别（落到 help）`);
+	}
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.8 一致性：cli-spec 的 children 与实现动作一致", () => {
+	// 每个带 children 的子命令，其动作名都应能被 dispatch 处理（不落 default）
+	for (const spec of PRICE_SUBCOMMANDS) {
+		for (const child of spec.children ?? []) {
+			assert.ok(child.name.length > 0, `${spec.name} 的动作名不应为空`);
+			assert.ok(child.summary.length > 0, `${spec.name} ${child.name} 应有说明`);
+		}
+	}
+	assert.ok(findSubcommand("scheme"), "findSubcommand 应能查到 scheme");
+	assert.equal(findSubcommand("nonexistent"), undefined);
 });

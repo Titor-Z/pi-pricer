@@ -21,6 +21,9 @@ import {
 	renderHelp,
 } from "./pricing-format.ts";
 import { PricingDrawer, isValidCalendarDate } from "./pricing-ui.ts";
+import { PRICE_SUBCOMMANDS, findSubcommand, PRICE_FIELDS } from "./pricing-cli-spec.ts";
+import type { AutocompleteItem } from "@earendil-works/pi-tui";
+import type { PricingSchema } from "./pricing-types.ts";
 
 /** 格式化价格值：支持 "4"、"4.5"、"¥4" 等输入 → 解析为 number */
 function parsePriceValue(raw: string): number | null {
@@ -60,7 +63,9 @@ export class PricingCommands {
 		seedPricing(this.filePath);
 
 		pi.registerCommand("price", {
-			description: "模型计费（v2 五注册表）：无参开抽屉 | model|scheme|rate|calendar|resolve|bind|unbind|schema|list|help",
+			description: "模型计费（v2 五注册表）：无参开抽屉 | model|scheme|rate|calendar|resolve|bind|unbind|move|schema|list|help",
+			// pi 只认这个字段生成扩展命令的参数补全（扩展无法设 argumentHint）
+			getArgumentCompletions: (prefix: string) => this.completeArguments(prefix),
 			handler: async (args: string, ctx: ExtensionCommandContext) => {
 				const parts = args.trim().split(/\s+/);
 				const sub = parts[0] ?? "";
@@ -115,6 +120,147 @@ export class PricingCommands {
 				}
 			},
 		});
+	}
+
+	/**
+	 * /price 的参数补全（pi 的 getArgumentCompletions 协议）。
+	 *
+	 * 分层规则：按已输入的 token 数决定补哪一层
+	 * - 第 1 个 token → 一级子命令
+	 * - 第 2 个 token → 二级动作（scheme/rate/calendar/move）
+	 * - 第 3+ 个 token → 动态 id（provider/model/plan/id/field/value）
+	 *
+	 * 任何异常都吞掉并降级为静态候选：补全抛错会破坏输入框体验。
+	 */
+	private completeArguments(argumentText: string): AutocompleteItem[] | null {
+		try {
+			return this.buildCompletions(argumentText);
+		} catch {
+			// 文件损坏等异常：退化为一级子命令候选
+			return this.toItems(PRICE_SUBCOMMANDS.map((s) => ({ value: s.name, description: s.summary })), "");
+		}
+	}
+
+	/**
+	 * 补全主逻辑（异常已在上层兜底）。
+	 *
+	 * 统一模型：把输入拆成 tokens，先求出"当前正在补的位置参数下标" slot，
+	 * 再按该位置的语义（provider/model/plan/direction/id/field/value）给候选。
+	 * 「末尾有空格」= 前一 token 已完成，正在开新 token；否则正在补最后一个 token。
+	 */
+	private buildCompletions(argumentText: string): AutocompleteItem[] | null {
+		const endsWithSpace = /\s$/.test(argumentText);
+		const trimmed = argumentText.trim();
+		const tokens = trimmed === "" ? [] : trimmed.split(/\s+/);
+
+		// 已完成的位置参数（末尾无空格时，最后一个 token 是"正在补"的，不算完成）
+		const settled = endsWithSpace || trimmed === "" ? tokens : tokens.slice(0, -1);
+		// 正在补的 token 前缀（末尾有空格时为空）
+		const prefix = endsWithSpace || trimmed === "" ? "" : tokens[tokens.length - 1];
+
+		// 第 1 个位置：一级子命令
+		if (settled.length === 0) {
+			return this.toItems(PRICE_SUBCOMMANDS.map((s) => ({ value: s.name, description: s.summary })), prefix);
+		}
+
+		const spec = findSubcommand(settled[0]);
+		if (!spec) return null;
+
+		// 判断是否已输入二级动作（scheme create / rate set / ...；move 的方向也是 action）
+		const action = spec.children?.find((c) => c.name === settled[1]);
+		// 位置参数语义表：有 action 用 action 的，否则用子命令自身的
+		const positionals = action ? (action.args ?? []) : (spec.args ?? []);
+		// 已消费的位置参数个数（减去子命令名，以及已输入的动作名）
+		const consumed = settled.slice(action ? 2 : 1);
+		const slotIndex = consumed.length;
+
+		// 第 2 个位置且尚未输入动作：补动作名（已输入动作时走位置语义）
+		if (!action && slotIndex === 0 && spec.children?.length) {
+			return this.toItems(spec.children.map((c) => ({ value: c.name, description: c.summary })), prefix);
+		}
+
+		// 其余：按位置语义给动态候选
+		const slot = positionals[slotIndex];
+		return this.completeDynamic(spec.name, slot, consumed, prefix);
+	}
+
+	/** 按位置参数语义给动态候选（读当前配置取真实 id） */
+	private completeDynamic(name: string, slot: string | undefined, consumed: string[], prefix: string): AutocompleteItem[] | null {
+		const schema = readPricing(this.filePath);
+		const providers = Object.keys(schema.providers);
+		const modelsOf = (p: string): string[] => Object.keys(schema.providers[p]?.models ?? {});
+
+		switch (slot) {
+			case "provider":
+				return this.toItems(
+					providers.map((p) => ({ value: p, description: `${modelsOf(p).length} 个模型` })),
+					prefix,
+				);
+			case "model": {
+				// 若 provider 已输入，只列该 provider 的模型；否则列全部
+				const pickedProvider = consumed[consumed.indexOf("provider") + 1];
+				void pickedProvider;
+				const scoped = consumed[0] && schema.providers[consumed[0]] ? modelsOf(consumed[0]) : undefined;
+				const all = providers.flatMap((p) => modelsOf(p).map((m) => ({ value: m, description: `${p}/${m}` })));
+				const items = scoped ? scoped.map((m) => ({ value: m, description: `${consumed[0]}/${m}` })) : all;
+				return this.toItems(items, prefix);
+			}
+			case "plan": {
+				// 优先列该模型已绑定的方案；无绑定信息时列出全部方案
+				const [provId, modelId] = consumed;
+				const bound = provId && modelId ? (schema.providers[provId]?.models[modelId]?.plans ?? []) : [];
+				if (bound.length > 0) {
+					return this.toItems(
+						bound.map((b) => ({ value: b.plan, description: schema.plans[b.plan]?.name ?? "已绑定" })),
+						prefix,
+					);
+				}
+				return this.toItems(
+					Object.entries(schema.plans).map(([id, pl]) => ({ value: id, description: pl.name })),
+					prefix,
+				);
+			}
+			case "direction":
+				return this.toItems(
+					(findSubcommand(name)?.children ?? []).map((c) => ({ value: c.name, description: c.summary })),
+					prefix,
+				);
+			case "field":
+				return this.toItems(PRICE_FIELDS.map((f) => ({ value: f })), prefix);
+			case "id":
+				return this.toItems(this.registryIds(name, schema), prefix);
+			default:
+				// 无位置参数语义的子命令（list/schema/help）不补
+				return null;
+		}
+	}
+
+	/** 按子命令取对应注册表的已有 id 候选 */
+	private registryIds(name: string, schema: PricingSchema): Array<{ value: string; description?: string }> {
+		switch (name) {
+			case "scheme":
+				return Object.entries(schema.plans).map(([id, p]) => ({ value: id, description: p.name }));
+			case "rate":
+				return Object.entries(schema.prices).map(([id, p]) => ({ value: id, description: p.name }));
+			case "calendar":
+				return Object.entries(schema.calendars).map(([id, c]) => ({ value: id, description: c.name }));
+			default:
+				return [];
+		}
+	}
+
+	/** 前缀过滤（忽略大小写）+ 去空值；无匹配返回 null（pi 约定） */
+	private toItems(candidates: Array<{ value: string; description?: string }>, prefix: string): AutocompleteItem[] | null {
+		const lower = prefix.toLowerCase();
+		const filtered = candidates
+			.filter((c) => c.value !== "")
+			.filter((c) => c.value.toLowerCase().startsWith(lower));
+		if (filtered.length === 0) return null;
+		return filtered.map((c) => ({
+			value: c.value,
+			label: c.value,
+			...(c.description ? { description: c.description } : {}),
+		}));
 	}
 
 	private showModel(provider: string | undefined, model: string | undefined, ctx: ExtensionCommandContext): void {

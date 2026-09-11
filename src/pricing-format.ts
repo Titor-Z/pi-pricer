@@ -10,6 +10,7 @@ import { listProviderModels, listProviders, resolveDebug } from "./pricing-query
 import { readPricing } from "./pricing-store.ts";
 import { describeSchedule, price } from "./pricing-desc.ts";
 import { isAlwaysRule } from "./pricing-builder.ts";
+import { GROUP_ORDER, GROUP_TITLES, PRICE_SUBCOMMANDS } from "./pricing-cli-spec.ts";
 
 /** 渲染 /price list 总览：所有厂商 + 模型价目卡片 */
 export function renderPriceList(filePath?: string): string {
@@ -240,38 +241,61 @@ export function renderResolveResult(model: string, provider: string, ts: Date | 
 	return lines.join("\n");
 }
 
-/** /price help：命令用法 */
+/** /price help：命令用法（从 PRICE_SUBCOMMANDS 单一数据源派生，避免与实现漂移） */
 export function renderHelp(): string {
-	return [
-		"",
-		"/price 模型计费（v2 五注册表原子化）",
-		"",
-		"  模型与绑定（默认面）",
-		"    /price                    开抽屉：厂商 → 模型 → 绑定（TUI）",
-		"    /price list               模型计费总览（文本）",
-		"    /price model <p> <m>      模型详情（绑定方案 + 实时生效）",
-		"    /price bind <p> <m> <plan>      追加绑定（末尾 = 最低优先级）",
-		"    /price unbind <p> <m> <plan>    移除绑定",
-		"    /price move <p> <m> <plan> <up|down|top|bottom>   调整优先级",
-		"",
-		"  管理面（TUI 下直达对应管理页；headless 输出文本）",
-		"    /price scheme [<id>]              方案列表 / 详情",
-		"    /price scheme create <id> [name]  新建方案（默认挂首个价格实体）",
-		"    /price scheme duplicate <id>      复制方案",
-		"    /price scheme delete <id>         删除方案（被绑定时拒绝）",
-		"    /price rate                       价格实体注册表",
-		"    /price rate create <id> [name]    新建价格实体",
-		"    /price rate set <id> <field> <v>  修改价格（field: input.miss|input.hit|output）",
-		"    /price rate delete <id>           删除价格（被引用时拒绝）",
-		"    /price calendar                   日历（节假日）资源",
-		"    /price calendar add <id> <name> <dates...>   新建日历",
-		"    /price calendar remove <id>       删除日历（被引用时拒绝）",
-		"",
-		"  调试与参考",
-		"    /price resolve <m> [p] [ts]  调试命中链（如 2026-09-16T10:00）",
-		"    /price schema                v2 结构说明",
-		"",
-		"注: 绑定重排序只走 CLI（TUI 抽屉不提供上下移）。",
-		"注: 命名沿革 — 原 plan/price 已改名 scheme/rate（避免 /price price 重复）。",
-	].join("\n");
+	const lines: string[] = ["", "/price 模型计费（v2 五注册表原子化）", ""];
+
+	for (const group of GROUP_ORDER) {
+		const specs = PRICE_SUBCOMMANDS.filter((s) => s.group === group);
+		if (specs.length === 0) continue;
+		lines.push(`  ${GROUP_TITLES[group]}`);
+		for (const spec of specs) {
+			lines.push(padUsage(`    ${formatUsage(spec)}`, spec.summary, 38));
+			// 二级动作单独列出（只列有参数提示的，避免刷屏）
+			for (const child of spec.children ?? []) {
+				if (!child.args?.length) continue;
+				const childUsage = `        /price ${spec.name} ${child.name} ${child.args.map(argPlaceholder).join(" ")}`;
+				lines.push(padUsage(childUsage, child.summary, 38));
+			}
+		}
+		lines.push("");
+	}
+
+	lines.push("注: 绑定重排序只走 CLI（TUI 抽屉不提供上下移）。");
+	lines.push("注: 命名沿革 — 原 plan/price 已改名 scheme/rate（避免 /price price 重复）。");
+	return lines.join("\n");
+}
+
+/** 对 usage 与说明做列对齐（usage 超宽时至少留一个空格，避免文字粘连） */
+function padUsage(usage: string, summary: string, column: number): string {
+	return usage.length >= column ? `${usage}  ${summary}` : `${usage.padEnd(column)}${summary}`;
+}
+
+/** 位置参数语义名 → usage 里的占位符（provider → <p> 等，保持 help 紧凑） */
+const ARG_PLACEHOLDERS: Record<string, string> = {
+	provider: "<p>",
+	model: "<m>",
+	plan: "<plan>",
+	price: "<id>",
+	calendar: "<id>",
+	id: "<id>",
+	name: "[name]",
+	field: "<field>",
+	value: "<value>",
+	dates: "<dates...>",
+	ts: "[ts]",
+	direction: "<up|down|top|bottom>",
+};
+
+/** 语义名 → 占位符（未知语义原样包角括号） */
+function argPlaceholder(arg: string): string {
+	return ARG_PLACEHOLDERS[arg] ?? `<${arg}>`;
+}
+
+/** 拼一条子命令的 usage（无参数则只留命令名） */
+function formatUsage(spec: { name: string; args?: string[]; children?: Array<{ args?: string[] }> }): string {
+	const base = `/price ${spec.name}`;
+	if (spec.args?.length) return `${base} ${spec.args.map(argPlaceholder).join(" ")}`;
+	// 无位置参数的子命令：若有带参数的二级动作，用 [<action>] 提示可下钻
+	return spec.children?.some((c) => c.args?.length) ? `${base} [<action>]` : base;
 }

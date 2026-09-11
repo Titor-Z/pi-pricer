@@ -39,7 +39,7 @@
 	],
 	"scripts": {
 		"typecheck": "tsc --noEmit",
-		"test": "node --test --test-force-exit \"test/**/*.test.mjs\"",
+		"test": "node --test --test-force-exit test/*.test.mjs",
 		"prepublishOnly": "npm run typecheck && npm test"
 	},
 	"peerDependencies": {

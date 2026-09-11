@@ -20,7 +20,7 @@ import {
 	renderResolveResult,
 	renderHelp,
 } from "./pricing-format.ts";
-import { PricingDrawer } from "./pricing-ui.ts";
+import { PricingDrawer, isValidCalendarDate } from "./pricing-ui.ts";
 
 /** 格式化价格值：支持 "4"、"4.5"、"¥4" 等输入 → 解析为 number */
 function parsePriceValue(raw: string): number | null {
@@ -60,7 +60,7 @@ export class PricingCommands {
 		seedPricing(this.filePath);
 
 		pi.registerCommand("price", {
-			description: "模型计费（v2 五注册表）：无参开抽屉 | model|plan|price|calendar|resolve|bind|unbind|schema|list|help",
+			description: "模型计费（v2 五注册表）：无参开抽屉 | model|scheme|rate|calendar|resolve|bind|unbind|schema|list|help",
 			handler: async (args: string, ctx: ExtensionCommandContext) => {
 				const parts = args.trim().split(/\s+/);
 				const sub = parts[0] ?? "";
@@ -80,13 +80,19 @@ export class PricingCommands {
 					case "model":
 						this.showModel(parts[1], parts[2], ctx);
 						break;
-					case "plan":
+					case "scheme":
+						// TUI 下直达方案管理页；headless 回退文本
+						if (await this.drawer.open(ctx, "scheme")) break;
 						this.planOp(parts[1], parts[2], parts[3], ctx);
 						break;
-					case "price":
+					case "rate":
+						// TUI 下直达价格管理页；headless 回退文本
+						if (await this.drawer.open(ctx, "rate")) break;
 						this.priceOp(parts[1], parts[2], parts[3], parts[4], ctx);
 						break;
 					case "calendar":
+						// TUI 下直达日历管理页；headless 回退文本
+						if (await this.drawer.open(ctx, "calendar")) break;
 						this.calendarOp(parts[1], parts[2], parts[3], parts.slice(4), ctx);
 						break;
 					case "resolve":
@@ -119,7 +125,7 @@ export class PricingCommands {
 		ctx.ui.notify(renderModelDetail(provider, model, this.filePath), "info");
 	}
 
-	/** /price plan [<id>] | plan create <id> <name> | plan duplicate <id> | plan delete <id> */
+	/** /price scheme [<id>] | scheme create <id> <name> | scheme duplicate <id> | scheme delete <id> */
 	private planOp(op: string | undefined, id: string | undefined, name: string | undefined, ctx: ExtensionCommandContext): void {
 		switch (op) {
 			case "create":
@@ -142,7 +148,7 @@ export class PricingCommands {
 	/** 新建方案：空方案无规则会导致校验失败，故默认挂上第一个价格实体作为 always 规则 */
 	private createPlan(planId: string | undefined, name: string | undefined, ctx: ExtensionCommandContext): void {
 		if (!planId) {
-			ctx.ui.notify("用法: /price plan create <plan-id> [name]", "info");
+			ctx.ui.notify("用法: /price scheme create <plan-id> [name]", "info");
 			return;
 		}
 		try {
@@ -150,7 +156,7 @@ export class PricingCommands {
 			updatePricing((data) => {
 				if (data.plans[planId]) throw new Error(`方案已存在: ${planId}`);
 				const firstPrice = Object.keys(data.prices)[0];
-				if (!firstPrice) throw new Error("价格注册表为空，请先 /price price create");
+				if (!firstPrice) throw new Error("价格注册表为空，请先 /price rate create");
 				data.plans[planId] = {
 					name: name ?? planId,
 					rules: [{ schedule: { timezone: "Asia/Shanghai", weekdays: [], ranges: [] }, price: firstPrice }],
@@ -167,7 +173,7 @@ export class PricingCommands {
 	/** 复制方案：新 id 自动去重（<id>-copy / <id>-copy2 ...） */
 	private duplicatePlan(planId: string | undefined, ctx: ExtensionCommandContext): void {
 		if (!planId) {
-			ctx.ui.notify("用法: /price plan duplicate <plan-id>", "info");
+			ctx.ui.notify("用法: /price scheme duplicate <plan-id>", "info");
 			return;
 		}
 		let newId = "";
@@ -194,7 +200,7 @@ export class PricingCommands {
 	/** 删除方案（引用于被绑定时拒绝） */
 	private deletePlan(planId: string | undefined, ctx: ExtensionCommandContext): void {
 		if (!planId) {
-			ctx.ui.notify("用法: /price plan delete <plan-id>", "info");
+			ctx.ui.notify("用法: /price scheme delete <plan-id>", "info");
 			return;
 		}
 		try {
@@ -234,9 +240,9 @@ export class PricingCommands {
 			ctx.ui.notify("用法: /price calendar add <id> <name> <dates...>\n  例: /price calendar add cn-holiday 法定节假日 01-01 10-01", "info");
 			return;
 		}
-		const bad = dates.find((d) => !/^(\d{4}-)?\d{2}-\d{2}$/.test(d));
+		const bad = dates.find((d) => !isValidCalendarDate(d));
 		if (bad) {
-			ctx.ui.notify(`无效日期: ${bad}（格式 YYYY-MM-DD 或 MM-DD）`, "info");
+			ctx.ui.notify(`无效日期: ${bad}（需 YYYY-MM-DD 或 MM-DD，且月份 01-12、日期合法）`, "info");
 			return;
 		}
 		try {
@@ -340,10 +346,10 @@ export class PricingCommands {
 		}
 	}
 
-	/** 新建价格实体：/price price create <id> <name>（初始价 0，用 price set 补） */
+	/** 新建价格实体：/price rate create <id> <name>（初始价 0，用 rate set 补） */
 	private createPrice(priceId: string | undefined, name: string | undefined, ctx: ExtensionCommandContext): void {
 		if (!priceId) {
-			ctx.ui.notify("用法: /price price create <price-id> [name]\n  建后可用 /price price set 修改数值", "info");
+			ctx.ui.notify("用法: /price rate create <price-id> [name]\n  建后可用 /price rate set 修改数值", "info");
 			return;
 		}
 		try {
@@ -356,12 +362,12 @@ export class PricingCommands {
 			ctx.ui.notify(`创建失败: ${(err as Error).message}`, "info");
 			return;
 		}
-		ctx.ui.notify(`已新建价格 ${priceId}（初值 0，可 /price price set ${priceId} output <value>）`, "info");
+		ctx.ui.notify(`已新建价格 ${priceId}（初值 0，可 /price rate set ${priceId} output <value>）`, "info");
 	}
 
 	private setPrice(priceId: string | undefined, field: string | undefined, value: string | undefined, ctx: ExtensionCommandContext): void {
 		if (!priceId || !field || !value) {
-			ctx.ui.notify("用法: /price price set <price-id> <input.miss|input.hit|output> <value>\n  例: /price price set deepseek-peak input.miss 2", "info");
+			ctx.ui.notify("用法: /price rate set <price-id> <input.miss|input.hit|output> <value>\n  例: /price rate set deepseek-peak input.miss 2", "info");
 			return;
 		}
 		const f = parsePriceField(field);
@@ -385,12 +391,12 @@ export class PricingCommands {
 			ctx.ui.notify(`修改失败: ${(err as Error).message}`, "info");
 			return;
 		}
-		ctx.ui.notify(`已修改价格 ${priceId} ${f} = ${v}（/price price 查看）`, "info");
+		ctx.ui.notify(`已修改价格 ${priceId} ${f} = ${v}（/price rate 查看）`, "info");
 	}
 
 	private deletePrice(priceId: string | undefined, ctx: ExtensionCommandContext): void {
 		if (!priceId) {
-			ctx.ui.notify("用法: /price price delete <price-id>", "info");
+			ctx.ui.notify("用法: /price rate delete <price-id>", "info");
 			return;
 		}
 		try {

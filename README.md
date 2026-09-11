@@ -30,12 +30,12 @@ npm install file:../pi-pricer
 
 | 命令 | 说明 |
 |---|---|
-| `/price` | 无参打开钻取抽屉（TUI）；无 TUI 时输出文本总览 |
+| `/price` | 无参打开抽屉（仅模型与绑定）；无 TUI 时输出文本总览 |
 | `/price list` | 文本总览（厂商 / 模型 / 实时价） |
 | `/price model <provider> <model>` | 单模型详情（绑定方案 + 实时生效价） |
-| `/price plan [<plan-id>]` | 方案清单 / 单个方案详情 |
-| `/price price [set <id> <field> <value>]` | 价格注册表 / 修改价格实体 |
-| `/price calendar` | 日历注册表 |
+| `/price scheme [<plan-id>]` | 方案管理（TUI 直达管理页 / headless 输出文本） |
+| `/price rate [create\|set\|delete ...]` | 价格管理（TUI 直达管理页 / headless 输出文本） |
+| `/price calendar [add\|remove ...]` | 日历管理（TUI 直达管理页 / headless 输出文本） |
 | `/price resolve <model> [provider] [YYYY-MM-DDTHH:mm]` | 调试解析链（显示命中/未命中及原因） |
 | `/price bind <provider> <model> <plan-id>` | 绑定方案（追加到末尾 = 最低优先级） |
 | `/price unbind <provider> <model> <plan-id>` | 解除绑定 |

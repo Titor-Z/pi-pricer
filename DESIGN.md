@@ -55,13 +55,36 @@ Pi 生态的模型计费数据共享中心。解决"厂商调价频繁，硬编�
 - 持有 `PricingDraft` 内存会话；`Ctrl+S`/`Ctrl+R` 在当前层拦截
 - Esc 回退层级 / 关闭；根层 Esc + 未保存时先提示如何处置
 
-### Provider List（Level 0）
-- SettingsList 展示所有厂商
+### Provider List（Level 0，默认根层）
+- SettingsList 展示所有厂商，**仅此一类内容**
 - 每行：`<provider-id>  (<N>模型 · <方案摘要>)`
 - Enter → 下钻 Model List
-- 尾部三个管理面项：方案注册表 / 价格注册表 / 日历注册表（各带 `submenu` 下钻）
+- 管理面（方案/价格/日历）**不再挂在根层**：根层职责单一（只看"谁的模型"），
+  管理面由子命令直达（`/price scheme|rate|calendar`）
 - 实现：每行 SettingItem 带 `submenu`，Enter 用 SettingsList 原生 submenu 机制
-  打开第 1 级；标题 Text.setText 随层级更新（同时推断是否在子菜单内）
+  打开第 1 级；标题 Text.setText 随层级更新
+
+### 直达管理页（initialPage）
+`open(ctx, page)` 支持 4 个初始页，对应 CLI 子命令：
+
+| page | CLI | 根标题 | 内容 |
+|---|---|---|---|
+| `models`（默认） | `/price` | `· 厂商` | 厂商列表 |
+| `scheme` | `/price scheme` | `· 方案` | 方案注册表 |
+| `rate` | `/price rate` | `· 价格` | 价格注册表 |
+| `calendar` | `/price calendar` | `· 日历` | 日历注册表 |
+
+- 直达页的 `depth` 初始为 1：**Esc 一次即退出**，不弹回无关的模型列表
+  （用户是有意打开该管理页的）
+- 保存/重置后的 `rebuildRoot()` 按初始页重建，不会跳回模型列表
+
+### 命名决策（v0.7）
+原 `plan` / `price` 子命令改名，理由：
+
+| 旧 | 新 | 理由 |
+|---|---|---|
+| `/price plan` | `/price scheme` | `plan` 在英文里首先是动词"计划"，与中文语义"方案"不对应 |
+| `/price price` | `/price rate` | `/price price set` 三处重复 price，读起来像结巴 |
 
 ### Model List（Level 1）
 - SettingsList 展示当前厂商下的所有模型
@@ -142,9 +165,9 @@ askText(tui, title, placeholder, onSubmit, onCancel?)
 | `/price` | 无参 → 三级抽屉（TUI）/ list 文本（headless） | 默认浏览 + 编辑 |
 | `/price list` | 文本输出 | 快速查看 |
 | `/price model <p> <m>` | 文本详情 | 查看单模型 |
-| `/price plan [<id>]` | 文本列表 / 详情 | 查看方案 |
-| `/price plan create\|duplicate\|delete` | 命令行 | 方案 CRUD（headless 可用） |
-| `/price price [create\|set\|delete]` | 命令行 | 价格实体 CRUD |
+| `/price scheme [<id>]` | TUI 直达方案管理页 / 文本列表 | 方案管理 |
+| `/price scheme create\|duplicate\|delete` | 命令行 | 方案 CRUD（headless 可用） |
+| `/price rate [create\|set\|delete]` | 命令行 | 价格实体 CRUD |
 | `/price calendar [add\|remove]` | 命令行 | 日历 CRUD |
 | `/price bind <p> <m> <plan>` | 命令行 | 追加绑定（末尾=最低优先级） |
 | `/price unbind <p> <m> <plan>` | 命令行 | 移除绑定 |

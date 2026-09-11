@@ -92,6 +92,21 @@ function parseDateTimeInput(raw: string): Date | null {
 	return Number.isNaN(date.getTime()) ? null : date;
 }
 
+/**
+ * 校验日历日期：形状（YYYY-MM-DD | MM-DD）+ 真实范围（月份 1-12，日按月份）。
+ * 仅用正则匹配形状会放过 2026-13-99 这类"形状正确但不存在"的日期。
+ */
+export function isValidCalendarDate(raw: string): boolean {
+	const m = /^(?:\d{4}-)?(\d{2})-(\d{2})$/.exec(raw);
+	if (!m) return false;
+	const month = Number(m[1]);
+	const day = Number(m[2]);
+	if (month < 1 || month > 12) return false;
+	// 2 月按闰年上限 29 取，避免误拒合法的 02-29
+	const maxDay = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
+	return day >= 1 && day <= maxDay;
+}
+
 /** 校验价格输入：支持 "4"、"4.5"、"¥0.02" */
 function parsePriceInput(raw: string): number | null {
 	const cleaned = raw.replace(/^¥/, "").trim();
@@ -99,6 +114,20 @@ function parsePriceInput(raw: string): number | null {
 	if (!Number.isFinite(num) || num < 0) return null;
 	return num;
 }
+
+/**
+ * 抽屉初始页：默认只显示模型（根层职责单一），管理面由子命令直达。
+ * 命名与 CLI 子命令一致（scheme / rate / calendar），见 AGENTS.md v0.7 决策。
+ */
+export type DrawerPage = "models" | "scheme" | "rate" | "calendar";
+
+/** 各初始页的根标题（Esc 回到此层时恢复） */
+const PAGE_TITLES: Record<DrawerPage, string> = {
+	models: ROOT_TITLE,
+	scheme: "模型计费配置 · 方案",
+	rate: "模型计费配置 · 价格",
+	calendar: "模型计费配置 · 日历",
+};
 
 /**
  * 三级钻取抽屉：独立于命令层，filePath 注入便于测试；不访问 pi ExtensionAPI。
@@ -109,12 +138,15 @@ export class PricingDrawer {
 
 	constructor(private readonly filePath?: string) {}
 
-	/** 打开抽屉；无 custom UI 时返回 false，交给命令层回退文本输出 */
-	async open(context: unknown): Promise<boolean> {
+	/**
+	 * 打开抽屉；无 custom UI 时返回 false，交给命令层回退文本输出。
+	 * page 指定初始页（默认 models = 厂商列表）；管理面子命令可直接跳到对应注册表。
+	 */
+	async open(context: unknown, page: DrawerPage = "models"): Promise<boolean> {
 		const ui = (context as { ui?: { custom?: unknown } })?.ui;
 		if (typeof ui?.custom !== "function") return false;
 		await (ui.custom as (factory: unknown) => Promise<unknown>)((tui: unknown, theme: DrawerTheme, _kb: unknown, done: (result?: undefined) => void) => {
-			return this.buildScene(tui as DrawerTui, theme, () => done(undefined));
+			return this.buildScene(tui as DrawerTui, theme, () => done(undefined), page);
 		});
 		return true;
 	}
@@ -123,20 +155,22 @@ export class PricingDrawer {
 	 * 组装抽屉场景（边框 + 动态标题 + 状态栏 + 第 0 级厂商列表）。
 	 * Ctrl+S / Ctrl+R 在顶层拦截，保证任意层级都能保存/重置。
 	 */
-	private buildScene(tui: DrawerTui, theme: DrawerTheme, close: () => void): Component {
+	private buildScene(tui: DrawerTui, theme: DrawerTheme, close: () => void, initialPage: DrawerPage = "models"): Component {
 		// 场景级 overlay 句柄槽：askText 由各 builders 调用，需要访问同一份打开状态
 		const overlaySlot: { current: { hide: () => void; dispose?: () => void } | null } = { current: null };
 		this.overlaySlot = overlaySlot;
 		const draft = new PricingDraft(this.filePath);
 		const container = new Container();
-		const title = new Text(theme.fg("accent", theme.bold(ROOT_TITLE)), 1, 1);
+		const rootTitleOfPage = PAGE_TITLES[initialPage];
+		const title = new Text(theme.fg("accent", theme.bold(rootTitleOfPage)), 1, 1);
 
 		/**
 		 * 当前钻取深度：根层为 0，每进一级 +1。
 		 * 为什么不用标题反推：标题是展示层状态，用它决定 Esc 归属会把展示与逻辑耦合，
 		 * 一旦某子页标题与根标题相同就会误判。深度计数是唯一的逻辑真相。
 		 */
-		let depth = 0;
+		// 直达管理页时已是"一层"（Esc 一次即退出，不弹回无关的模型列表）
+		let depth = initialPage === "models" ? 0 : 1;
 
 		/** 换标题并强制重绘（纯展示，不承担状态推断） */
 		const setTitle = (text: string): void => {
@@ -222,13 +256,18 @@ export class PricingDrawer {
 			container.invalidate();
 		};
 
-		/** 重建厂商列表（保存/重置后价格列需要刷新） */
+		/**
+		 * 重建根列表（保存/重置后价格列需要刷新）。
+		 * 按初始页分派：models = 厂商列表；其余 = 对应注册表（子命令直达用）。
+		 */
 		const rebuildRoot = (): void => {
 			if (rootList) container.removeChild(rootList);
-			rootList = this.buildProviderList(draft, tui, theme, setTitle, refreshStatus, enterLevel, leaveLevel, pushPage, popPage, close);
+			rootList = this.buildRootList(initialPage, draft, tui, theme, setTitle, refreshStatus, enterLevel, leaveLevel, pushPage, popPage, close);
 			container.addChild(rootList);
 			container.invalidate();
 		};
+
+
 
 		container.addChild(new DynamicBorder((s: string) => theme.fg("borderAccent", s)));
 		container.addChild(title);
@@ -274,6 +313,38 @@ export class PricingDrawer {
 		};
 	}
 
+	/**
+	 * 根列表分派：models = 厂商列表；scheme/rate/calendar = 直达对应注册表。
+	 * 管理面不再挂在模型列表尾部（根层职责单一），改由子命令直达，
+	 * 因此这里需要按初始页构造不同根列表。
+	 */
+	private buildRootList(
+		page: DrawerPage,
+		draft: PricingDraft,
+		tui: DrawerTui,
+		theme: DrawerTheme,
+		setTitle: (text: string) => void,
+		refreshStatus: (msg?: string) => void,
+		enterLevel: () => void,
+		leaveLevel: () => void,
+		pushPage: (component: Component) => void,
+		popPage: () => void,
+		goBack: () => void,
+	): SettingsList {
+		void pushPage;
+		void popPage;
+		switch (page) {
+			case "scheme":
+				return this.buildPlanRegistry(draft, tui, theme, setTitle, refreshStatus, enterLevel, leaveLevel, goBack);
+			case "rate":
+				return this.buildPriceRegistry(draft, tui, theme, setTitle, refreshStatus, enterLevel, leaveLevel, goBack);
+			case "calendar":
+				return this.buildCalendarRegistry(draft, tui, theme, refreshStatus, enterLevel, leaveLevel, goBack);
+			default:
+				return this.buildProviderList(draft, tui, theme, setTitle, refreshStatus, enterLevel, leaveLevel, pushPage, popPage, goBack);
+		}
+	}
+
 	/** 第 0 级：厂商列表（Enter 下钻到该厂商的模型列表） */
 	private buildProviderList(
 		draft: PricingDraft,
@@ -304,52 +375,9 @@ export class PricingDrawer {
 			},
 		}));
 
-		// 管理面入口（第 0 级尾部）：方案 / 价格 / 日历 / 解析调试
-		items.push({
-			id: "__plans",
-			label: "方案注册表",
-			currentValue: `${Object.keys(draft.snapshot().plans).length} 个`,
-			description: "计费方案：规则顺序即优先级（first match wins）",
-			submenu: (_v, done) => {
-				enterLevel();
-				setTitle(levelTitle("方案"));
-				return this.buildPlanRegistry(draft, tui, theme, setTitle, refreshStatus, enterLevel, leaveLevel, () => {
-					setTitle(ROOT_TITLE);
-					leaveLevel();
-					done(undefined);
-				});
-			},
-		});
-		items.push({
-			id: "__prices",
-			label: "价格注册表",
-			currentValue: `${Object.keys(draft.snapshot().prices).length} 个`,
-			description: "可复用价格实体（¥/百万 token）",
-			submenu: (_v, done) => {
-				enterLevel();
-				setTitle(levelTitle("价格"));
-				return this.buildPriceRegistry(draft, tui, theme, setTitle, refreshStatus, enterLevel, leaveLevel, () => {
-					setTitle(ROOT_TITLE);
-					leaveLevel();
-					done(undefined);
-				});
-			},
-		});
-		items.push({
-			id: "__calendars",
-			label: "日历注册表",
-			currentValue: `${Object.keys(draft.snapshot().calendars).length} 个`,
-			description: "节假日/特殊日期资源，可被 schedule 引用",
-			submenu: (_v, done) => {
-				enterLevel();
-				setTitle(levelTitle("日历"));
-				return this.buildCalendarRegistry(draft, tui, theme, refreshStatus, enterLevel, leaveLevel, () => {
-					setTitle(ROOT_TITLE);
-					leaveLevel();
-					done(undefined);
-				});
-			},
-		});
+		// 管理面（方案/价格/日历）不再挂在这里：根层职责单一，仅展示模型；
+		// 管理面由子命令直达（/price scheme | rate | calendar）。
+
 		return new SettingsList(
 			items,
 			Math.min(items.length + 4, 12),
@@ -810,7 +838,7 @@ export class PricingDrawer {
 					refreshStatus(`规则 #${ruleIndex} 有效期设为 ${value || "无"}（Ctrl+S 保存）`);
 					finish();
 				}, () => { refreshStatus("已取消输入"); finish(); });
-				return this.buildTextPage("编辑器已打开（若终端不支持覆盖层，请改用 /price plan 命令）", finish);
+				return this.buildTextPage("编辑器已打开（若终端不支持覆盖层，请改用 /price scheme 命令）", finish);
 			},
 		});
 		items.push({
@@ -978,7 +1006,7 @@ export class PricingDrawer {
 					this.askText(tui, `${id} 的日期（逗号分隔）`, "01-01, 10-01", (rawDates) => {
 						const dates = rawDates.split(/[,，\s]+/).filter(Boolean);
 						if (dates.length === 0) { refreshStatus(theme.fg("error", "至少需要一个日期")); finish(); return; }
-						const bad = dates.find((d) => !/^(\d{4}-)?\d{2}-\d{2}$/.test(d));
+						const bad = dates.find((d) => !isValidCalendarDate(d));
 						if (bad) { refreshStatus(theme.fg("error", `无效日期: ${bad}（需 YYYY-MM-DD 或 MM-DD）`)); finish(); return; }
 						draft.upsertCalendar(id, { name: id, dates });
 						refreshStatus(`已新建日历 ${id}（${dates.length} 天；Ctrl+S 保存）`);

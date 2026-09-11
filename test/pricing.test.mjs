@@ -488,7 +488,7 @@ test("format：renderResolveResult 命中链与兜底链", () => {
 test("format：renderHelp 含主要子命令", () => {
 	const t = renderHelp();
 	assert.ok(t.includes("/price resolve"));
-	assert.ok(t.includes("/price plan"));
+	assert.ok(t.includes("/price scheme"));
 	assert.ok(t.includes("/price bind"));
 });
 
@@ -662,7 +662,7 @@ test("挂载：/price bind 追加末尾（最低优先级）→ 绑定数+1 / �
 	rmSync(dir, { recursive: true, force: true });
 });
 
-test("挂载：/price price set 修改实体 → resolve 反映；删除被引用价格被拒", async () => {
+test("挂载：/price rate set 修改实体 → resolve 反映；删除被引用价格被拒", async () => {
 	const dir = tmpDir();
 	const path = join(dir, "pricing.json");
 	writePricing(FIXTURE, path);
@@ -670,17 +670,17 @@ test("挂载：/price price set 修改实体 → resolve 反映；删除被引�
 	const ctx = cmdCtx({ withCustom: false });
 	ctx.ui = { notify: ctx.ui.notify };
 
-	await handler("price set peak output 9", ctx);
+	await handler("rate set peak output 9", ctx);
 	assert.ok(ctx.notifications.at(-1).includes("已修改价格"));
 	assert.equal(resolvePricing("deepseek-flash", "deepseek", PEAK_TS, path).output, 9);
 
 	ctx.notifications.length = 0;
-	await handler("price delete peak", ctx);
+	await handler("rate delete peak", ctx);
 	assert.ok(ctx.notifications.at(-1).includes("仍被方案"), "被引用的价格应拒绝删除");
 	rmSync(dir, { recursive: true, force: true });
 });
 
-test("挂载：/price resolve 输出命中链；/price plan 输出清单列表", async () => {
+test("挂载：/price resolve 输出命中链；/price scheme 输出方案列表", async () => {
 	const dir = tmpDir();
 	const path = writeFixture(dir);
 	const { handler } = mountAt(path);
@@ -692,7 +692,7 @@ test("挂载：/price resolve 输出命中链；/price plan 输出清单列表",
 	assert.ok(hitText.includes("命中"), "resolve 应输出命中链");
 
 	ctx.notifications.length = 0;
-	await handler("plan", ctx);
+	await handler("scheme", ctx);
 	assert.ok(ctx.notifications.at(-1).includes("工作日高峰"), "plan 列表含方案名");
 
 	ctx.notifications.length = 0;
@@ -872,31 +872,31 @@ test("挂载：/price move 越界不破坏数据；无效方向被拒", async ()
 
 // ── v0.5 CLI：管理面 CRUD ────────────────────────────────────────────────
 
-test("挂载：/price plan create|duplicate|delete", async () => {
+test("挂载：/price scheme create|duplicate|delete", async () => {
 	const dir = tmpDir();
 	const path = writeFixture(dir);
 	const { handler } = mountAt(path);
 	const ctx = cmdCtx({ withCustom: false });
 	ctx.ui = { notify: ctx.ui.notify };
 
-	await handler("plan create myplan 我的方案", ctx);
+	await handler("scheme create myplan 我的方案", ctx);
 	assert.ok(ctx.notifications.at(-1).includes("已新建方案 myplan"));
 	assert.ok(readPricing(path).plans.myplan, "方案应写入");
 	assert.equal(readPricing(path).plans.myplan.rules.length, 1, "默认挂一条规则");
 
 	ctx.notifications.length = 0;
-	await handler("plan duplicate myplan", ctx);
+	await handler("scheme duplicate myplan", ctx);
 	assert.ok(ctx.notifications.at(-1).includes("myplan-copy"));
 	assert.ok(readPricing(path).plans["myplan-copy"]);
 
 	ctx.notifications.length = 0;
-	await handler("plan delete myplan-copy", ctx);
+	await handler("scheme delete myplan-copy", ctx);
 	assert.ok(ctx.notifications.at(-1).includes("已删除方案"));
 	assert.equal(readPricing(path).plans["myplan-copy"], undefined);
 
 	// 被绑定的方案拒绝删除
 	ctx.notifications.length = 0;
-	await handler("plan delete peakworkday", ctx);
+	await handler("scheme delete peakworkday", ctx);
 	assert.ok(ctx.notifications.at(-1).includes("仍被"), "被绑定方案应拒绝删除");
 	rmSync(dir, { recursive: true, force: true });
 });
@@ -918,8 +918,8 @@ test("挂载：/price calendar add|remove 与被引用保护", async () => {
 
 	// 引用了日历的方案 → 删除该引用方案前，日历不可删
 	ctx.notifications.length = 0;
-	await handler("plan delete peakworkday", ctx);  // 先解除对日历的潜在引用（此处无引用，故成功）
-	await handler("plan create calplan 日历方案", ctx);
+	await handler("scheme delete peakworkday", ctx);  // 先解除对日历的潜在引用（此处无引用，故成功）
+	await handler("scheme create calplan 日历方案", ctx);
 	updatePricing((data) => {
 		data.plans.calplan.rules[0].schedule.calendar = "promo";
 		return data;
@@ -939,19 +939,19 @@ test("挂载：/price calendar add|remove 与被引用保护", async () => {
 	rmSync(dir, { recursive: true, force: true });
 });
 
-test("挂载：/price price create", async () => {
+test("挂载：/price rate create", async () => {
 	const dir = tmpDir();
 	const path = writeFixture(dir);
 	const { handler } = mountAt(path);
 	const ctx = cmdCtx({ withCustom: false });
 	ctx.ui = { notify: ctx.ui.notify };
 
-	await handler("price create myprice 我的价格", ctx);
+	await handler("rate create myprice 我的价格", ctx);
 	assert.ok(ctx.notifications.at(-1).includes("已新建价格 myprice"));
 	assert.equal(readPricing(path).prices.myprice.output, 0, "初始价为 0");
 
 	ctx.notifications.length = 0;
-	await handler("price create myprice", ctx);
+	await handler("rate create myprice", ctx);
 	assert.ok(ctx.notifications.at(-1).includes("已存在"), "重复创建应被拒");
 	rmSync(dir, { recursive: true, force: true });
 });
@@ -1029,7 +1029,7 @@ test("抽屉：Ctrl+R 丢弃未保存改动", async () => {
 	rmSync(dir, { recursive: true, force: true });
 });
 
-test("抽屉：管理面入口（方案/价格/日历）可下钻", async () => {
+test("v0.7 根层只含模型：管理面入口不再挂在厂商列表尾部", async () => {
 	const dir = tmpDir();
 	const path = join(dir, "pricing.json");
 	writePricing(FIXTURE, path);
@@ -1038,18 +1038,44 @@ test("抽屉：管理面入口（方案/价格/日历）可下钻", async () => 
 	const handle = runDrawer(ctx.captured);
 
 	const root = plainOf(handle);
-	assert.ok(root.includes("方案注册表"), "根层应含方案注册表入口");
-	assert.ok(root.includes("价格注册表"), "根层应含价格注册表入口");
-	assert.ok(root.includes("日历注册表"), "根层应含日历注册表入口");
+	assert.ok(root.includes("deepseek"), "根层应含厂商");
+	assert.ok(root.includes("glm"), "根层应含厂商");
+	assert.ok(!root.includes("方案注册表"), "根层不应再有方案注册表入口");
+	assert.ok(!root.includes("价格注册表"), "根层不应再有价格注册表入口");
+	assert.ok(!root.includes("日历注册表"), "根层不应再有日历注册表入口");
+	rmSync(dir, { recursive: true, force: true });
+});
 
-	// 下钻到方案注册表：根列表 = 2 厂商(deepseek, glm) + 方案/价格/日历 = 5 项
-	// 从 deepseek 起 down 2 次到达「方案注册表」
-	handle.handleInput("\u001b[B");  // down -> glm
-	handle.handleInput("\u001b[B");  // down -> 方案注册表
-	handle.handleInput("\r");
-	const plansPage = plainOf(handle);
-	assert.ok(plansPage.includes("工作日高峰"), "方案注册表应列出方案名");
-	assert.ok(plansPage.includes("模型计费配置 · 方案"), "标题应更新为方案层级");
+test("v0.7 直达页：scheme/rate/calendar 打开即为对应管理页", async () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+
+	for (const [page, title, content] of [
+		["scheme", "模型计费配置 · 方案", "工作日高峰"],
+		["rate", "模型计费配置 · 价格", "峰价"],
+		["calendar", "模型计费配置 · 日历", "节假日"],
+	]) {
+		const ctx = drawerCtx();
+		await new PricingDrawer(path).open(ctx, page);
+		const out = plainOf(runDrawer(ctx.captured));
+		assert.ok(out.includes(title), `${page} 标题应为 ${title}`);
+		assert.ok(out.includes(content), `${page} 应列出注册表内容`);
+		assert.ok(!out.includes("deepseek  ("), `${page} 不应显示厂商列表`);
+	}
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.7 直达页：Esc 一次即退出（不弹回模型列表）", async () => {
+	const dir = tmpDir();
+	const path = join(dir, "pricing.json");
+	writePricing(FIXTURE, path);
+	const ctx = drawerCtx();
+	await new PricingDrawer(path).open(ctx, "scheme");
+	const handle = runDrawer(ctx.captured);
+
+	handle.handleInput("\x1b");
+	assert.equal(handle.doneCount(), 1, "直达页 Esc 应一次退出");
 	rmSync(dir, { recursive: true, force: true });
 });
 
@@ -1142,7 +1168,7 @@ test("v0.6 抽屉内新建方案：overlay 输入 → 内存生效 → Ctrl+S �
 	const path = join(dir, "pricing.json");
 	writePricing(FIXTURE, path);
 	const ctx = drawerCtx();
-	await new PricingDrawer(path).open(ctx);
+	await new PricingDrawer(path).open(ctx, "scheme");
 
 	// 捕获 showOverlay 弹入的输入组件，用于模拟用户输入
 	let overlay = null;
@@ -1151,9 +1177,6 @@ test("v0.6 抽屉内新建方案：overlay 输入 → 内存生效 → Ctrl+S �
 	const handle = ctx.captured.factory(tui, { fg: (c, t) => t, bold: (t) => t }, {}, () => { doneCount += 1; });
 	const plain = () => handle.render(100).join("\n").replace(/\u001b\[\d+(;\d+)*m/g, "");
 
-	// 根层索引 2 = 方案注册表
-	handle.handleInput("\u001b[B"); handle.handleInput("\u001b[B");
-	handle.handleInput("\r");
 	assert.ok(plain().includes("＋ 新建方案"), "方案注册表应有新建入口");
 
 	handle.handleInput("\r");   // 打开新建（首项）
@@ -1179,14 +1202,13 @@ test("v0.6 抽屉内新建方案：id 重复被拒且不写入", async () => {
 	const path = join(dir, "pricing.json");
 	writePricing(FIXTURE, path);
 	const ctx = drawerCtx();
-	await new PricingDrawer(path).open(ctx);
+	await new PricingDrawer(path).open(ctx, "scheme");
 
 	let overlay = null;
 	const tui = { showOverlay: (comp) => { overlay = comp; return { hide() {} }; } };
 	const handle = ctx.captured.factory(tui, { fg: (c, t) => t, bold: (t) => t }, {}, () => {});
 	const plain = () => handle.render(100).join("\n").replace(/\u001b\[\d+(;\d+)*m/g, "");
 
-	handle.handleInput("\u001b[B"); handle.handleInput("\u001b[B"); handle.handleInput("\r");
 	handle.handleInput("\r");
 	overlay.handleInput("valleyalways");   // 已存在的方案 id
 	overlay.handleInput("\r");
@@ -1202,15 +1224,12 @@ test("v0.6 抽屉内新建价格实体：overlay 输入 → 落盘", async () =>
 	const path = join(dir, "pricing.json");
 	writePricing(FIXTURE, path);
 	const ctx = drawerCtx();
-	await new PricingDrawer(path).open(ctx);
+	await new PricingDrawer(path).open(ctx, "rate");
 
 	let overlay = null;
 	const tui = { showOverlay: (comp) => { overlay = comp; return { hide() {} }; } };
 	const handle = ctx.captured.factory(tui, { fg: (c, t) => t, bold: (t) => t }, {}, () => {});
 
-	// 价格注册表（索引 3）
-	handle.handleInput("\u001b[B"); handle.handleInput("\u001b[B"); handle.handleInput("\u001b[B");
-	handle.handleInput("\r");
 	handle.handleInput("\r");   // 新建价格（首项）
 	assert.ok(overlay !== null, "应弹出输入层");
 	overlay.handleInput("vendor-new");
@@ -1228,16 +1247,13 @@ test("v0.6 抽屉内新建日历：两步输入 + 非法日期被拒", async () 
 	const path = join(dir, "pricing.json");
 	writePricing(FIXTURE, path);
 	const ctx = drawerCtx();
-	await new PricingDrawer(path).open(ctx);
+	await new PricingDrawer(path).open(ctx, "calendar");
 
 	let overlay = null;
 	const tui = { showOverlay: (comp) => { overlay = comp; return { hide() {} }; } };
 	const handle = ctx.captured.factory(tui, { fg: (c, t) => t, bold: (t) => t }, {}, () => {});
 	const plain = () => handle.render(100).join("\n").replace(/\u001b\[\d+(;\d+)*m/g, "");
 
-	// 日历注册表（索引 4）
-	handle.handleInput("\u001b[B"); handle.handleInput("\u001b[B"); handle.handleInput("\u001b[B"); handle.handleInput("\u001b[B");
-	handle.handleInput("\r");
 	handle.handleInput("\r");   // 新建日历（首项）
 	overlay.handleInput("promo-2026");
 	overlay.handleInput("\r");
@@ -1250,7 +1266,12 @@ test("v0.6 抽屉内新建日历：两步输入 + 非法日期被拒", async () 
 	assert.ok(saved.calendars["promo-2026"], "新日历应落盘");
 	assert.deepEqual(saved.calendars["promo-2026"].dates, ["03-15", "2026-06-18"], "日期应被正确切分");
 
-	// 非法日期路径
+	// 非法日期路径：Ctrl+S 后列表已重建，需选回「＋ 新建日历」那一行
+	for (let i = 0; i < 6; i++) {
+		const row = plain().split("\n").map((l) => l.trim()).find((l) => l.startsWith("→"));
+		if (row && row.includes("新建日历")) break;
+		handle.handleInput("\u001b[B");
+	}
 	handle.handleInput("\r");
 	overlay.handleInput("bad-cal");
 	overlay.handleInput("\r");
@@ -1285,14 +1306,16 @@ test("v0.6 日历删除只回退一级（不再双重 goBack）", async () => {
 	const path = join(dir, "pricing.json");
 	writePricing(FIXTURE, path);
 	const ctx = drawerCtx();
-	await new PricingDrawer(path).open(ctx);
+	await new PricingDrawer(path).open(ctx, "calendar");
 	const handle = runDrawer(ctx.captured);
 
-	handle.handleInput("\u001b[B"); handle.handleInput("\u001b[B"); handle.handleInput("\u001b[B"); handle.handleInput("\u001b[B");
-	handle.handleInput("\r");              // 进入日历注册表
-	assert.ok(plainOf(handle).includes("模型计费配置 · 日历"));
-	handle.handleInput("\r");              // 首项 = 新建日历（unshift）→ 跳过，改测已有日历删除
-	handle.handleInput("\x1b");
+	assert.ok(plainOf(handle).includes("模型计费配置 · 日历"), "应直达日历管理页");
+	// 首项 = ＋新建日历；下移到已有日历 holidays 再删除
+	handle.handleInput("\u001b[B");
+	handle.handleInput("\r");              // 删除该日历
+	handle.handleInput("\r");              // 确认删除
+	assert.ok(plainOf(handle).includes("模型计费配置 · 日历"), "删除后应仍在日历管理页（只回退一级）");
+	assert.equal(handle.doneCount(), 0, "不应退出抽屉");
 	rmSync(dir, { recursive: true, force: true });
 });
 
@@ -1379,8 +1402,6 @@ test("v0.6 渲染：各页面在 80/120 列下均无行超宽", async () => {
 	handle.handleInput("\x1b");
 	handle.handleInput("\x1b");
 	handle.handleInput("\x1b");
-	handle.handleInput("\u001b[B"); handle.handleInput("\u001b[B");
-	handle.handleInput("\r");
 	pages.push(["方案注册表", plainOf(handle, 80)]);
 
 	for (const [name, text] of pages) {
@@ -1439,9 +1460,9 @@ function selectRootItem(handle, plain, label) {
 	return false;
 }
 
-async function openDrawerWith(path) {
+async function openDrawerWith(path, page = "models") {
 	const ctx = drawerCtx();
-	await new PricingDrawer(path).open(ctx);
+	await new PricingDrawer(path).open(ctx, page);
 	const { state, tui } = overlayTui();
 	const handle = ctx.captured.factory(tui, { fg: (c, t) => t, bold: (t) => t }, {}, () => {});
 	const plain = () => handle.render(100).join("\n").replace(/\u001b\[\d+(;\d+)*m/g, "");
@@ -1452,11 +1473,9 @@ test("v0.6.1 新建日历：Esc 取消 → 覆盖层关闭且不写入", async (
 	const dir = tmpDir();
 	const path = join(dir, "pricing.json");
 	writePricing(FIXTURE, path);
-	const { handle, state, plain } = await openDrawerWith(path);
+	const { handle, state, plain } = await openDrawerWith(path, "calendar");
 
-	assert.ok(selectRootItem(handle, plain, "日历注册表"), "应能在根层找到日历注册表");
-	handle.handleInput("\r");
-	assert.ok(plain().includes("· 日历"), "应进入日历注册表");
+	assert.ok(plain().includes("· 日历"), "应直达日历管理页");
 
 	handle.handleInput("\r");  // ＋ 新建日历（首项）
 	assert.equal(state.overlayCount, 1, "应弹出输入覆盖层");
@@ -1472,10 +1491,8 @@ test("v0.6.1 新建日历：第一步取消后不进入第二步", async () => {
 	const dir = tmpDir();
 	const path = join(dir, "pricing.json");
 	writePricing(FIXTURE, path);
-	const { handle, state, plain } = await openDrawerWith(path);
+	const { handle, state, plain } = await openDrawerWith(path, "calendar");
 
-	assert.ok(selectRootItem(handle, plain, "日历注册表"));
-	handle.handleInput("\r");
 	handle.handleInput("\r");
 	state.overlay.handleInput("\x1b");   // 第一步取消
 	assert.equal(state.overlayCount, 1, "取消第一步不应弹出第二步输入");
@@ -1487,10 +1504,8 @@ test("v0.6.1 新建日历：第二步 Esc 取消 → 整体放弃不留半创建
 	const dir = tmpDir();
 	const path = join(dir, "pricing.json");
 	writePricing(FIXTURE, path);
-	const { handle, state, plain } = await openDrawerWith(path);
+	const { handle, state, plain } = await openDrawerWith(path, "calendar");
 
-	assert.ok(selectRootItem(handle, plain, "日历注册表"));
-	handle.handleInput("\r");
 	handle.handleInput("\r");           // 第一步
 	state.overlay.handleInput("my-cal");
 	state.overlay.handleInput("\r");    // 提交 id → 进入第二步
@@ -1510,18 +1525,14 @@ test("v0.6.1 新建方案/价格：Esc 取消不写入", async () => {
 	writePricing(FIXTURE, path);
 
 	// 方案注册表
-	let d = await openDrawerWith(path);
-	assert.ok(selectRootItem(d.handle, d.plain, "方案注册表"));
-	d.handle.handleInput("\r");
+	let d = await openDrawerWith(path, "scheme");
 	d.handle.handleInput("\r");
 	d.state.overlay.handleInput("\x1b");
 	assert.equal(d.state.hideCalls, 1, "方案输入覆盖层应关闭");
 	assert.equal(Object.keys(readPricing(path).plans).length, 3, "取消不得新增方案");
 
 	// 价格注册表
-	d = await openDrawerWith(path);
-	assert.ok(selectRootItem(d.handle, d.plain, "价格注册表"));
-	d.handle.handleInput("\r");
+	d = await openDrawerWith(path, "rate");
 	d.handle.handleInput("\r");
 	d.state.overlay.handleInput("\x1b");
 	assert.equal(d.state.hideCalls, 1, "价格输入覆盖层应关闭");
@@ -1533,10 +1544,8 @@ test("v0.6.1 价格字段编辑：Esc 取消不改值", async () => {
 	const dir = tmpDir();
 	const path = join(dir, "pricing.json");
 	writePricing(FIXTURE, path);
-	const { handle, state, plain } = await openDrawerWith(path);
+	const { handle, state, plain } = await openDrawerWith(path, "rate");
 
-	assert.ok(selectRootItem(handle, plain, "价格注册表"));
-	handle.handleInput("\r");   // 价格注册表
 	handle.handleInput("\r");   // 首个价格实体 → ActionMenu
 	handle.handleInput("\r");   // 改输出价
 	assert.equal(state.overlayCount, 1, "应弹出数值输入");
@@ -1551,11 +1560,9 @@ test("v0.6.1 覆盖层打开时底层列表不响应按键", async () => {
 	const dir = tmpDir();
 	const path = join(dir, "pricing.json");
 	writePricing(FIXTURE, path);
-	const { handle, state, plain } = await openDrawerWith(path);
+	const { handle, state, plain } = await openDrawerWith(path, "calendar");
 
 	const row = () => plain().split("\n").map((l) => l.trim()).find((l) => l.startsWith("→"));
-	assert.ok(selectRootItem(handle, plain, "日历注册表"));
-	handle.handleInput("\r");   // 进入日历注册表
 	const selectedBefore = row();
 	assert.ok(selectedBefore, "注册表应有选中行");
 
@@ -1572,5 +1579,95 @@ test("v0.6.1 覆盖层打开时底层列表不响应按键", async () => {
 	state.overlay.handleInput("\x1b");   // 关闭覆盖层
 	assert.equal(row(), selectedBefore, "覆盖层打开期间的方向键不应移动底层选中项");
 	assert.ok(plain().includes("· 日历"), "应仍停留在日历注册表页");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+// ── v0.7 命令面改名 + 直达管理页 ────────────────────────────────────────
+
+test("v0.7 子命令改名：scheme/rate/calendar 生效，旧名 plan/price 不再识别", async () => {
+	const dir = tmpDir();
+	const path = writeFixture(dir);
+	const { handler } = mountAt(path);
+	const ctx = cmdCtx({ withCustom: false });
+	ctx.ui = { notify: ctx.ui.notify };
+
+	await handler("scheme", ctx);
+	assert.ok(ctx.notifications.at(-1).includes("工作日高峰"), "scheme 应输出方案列表");
+
+	ctx.notifications.length = 0;
+	await handler("rate", ctx);
+	assert.ok(ctx.notifications.at(-1).includes("峰价"), "rate 应输出价格注册表");
+
+	ctx.notifications.length = 0;
+	await handler("calendar", ctx);
+	assert.ok(ctx.notifications.at(-1).includes("节假日"), "calendar 应输出日历注册表");
+
+	// 旧名已移除 → 落到 default 分支输出 help
+	ctx.notifications.length = 0;
+	await handler("plan", ctx);
+	assert.ok(ctx.notifications.at(-1).includes("/price scheme"), "旧名 plan 应回退 help");
+
+	ctx.notifications.length = 0;
+	await handler("price", ctx);
+	assert.ok(ctx.notifications.at(-1).includes("/price rate"), "旧名 price 应回退 help");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.7 子命令在 TUI 下直达对应管理页", async () => {
+	const dir = tmpDir();
+	const path = writeFixture(dir);
+
+	for (const [sub, title] of [
+		["scheme", "模型计费配置 · 方案"],
+		["rate", "模型计费配置 · 价格"],
+		["calendar", "模型计费配置 · 日历"],
+	]) {
+		const ctx = drawerCtx();
+		const { handler } = mountAt(path);
+		await handler(sub, ctx);
+		assert.ok(ctx.captured.factory, `${sub} 应打开抽屉`);
+		const out = plainOf(runDrawer(ctx.captured));
+		assert.ok(out.includes(title), `${sub} 应直达 ${title}`);
+	}
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("v0.7 renderHelp 列出新命令面且不提旧名", async () => {
+	const { renderHelp } = await jiti.import(`${SRC}/pricing-format.ts`);
+	const help = renderHelp();
+	assert.ok(help.includes("/price scheme"));
+	assert.ok(help.includes("/price rate"));
+	assert.ok(help.includes("/price calendar"));
+	// 只允许"命名沿革"注释里提及旧名，不应作为可用命令列出
+	const commandLines = help.split("\n").filter((l) => l.trim().startsWith("/price"));
+	assert.ok(!commandLines.some((l) => /\/price plan\b/.test(l)), "不应再把 /price plan 列为命令");
+	assert.ok(!commandLines.some((l) => /\/price price\b/.test(l)), "不应再把 /price price 列为命令");
+});
+
+test("v0.7 日历日期校验：形状正确但不存在（2026-13-99）被拒", async () => {
+	const { isValidCalendarDate } = await jiti.import(`${SRC}/pricing-ui.ts`);
+	assert.equal(isValidCalendarDate("2026-13-99"), false, "月份 13 应被拒");
+	assert.equal(isValidCalendarDate("13-01"), false, "月份 13 应被拒");
+	assert.equal(isValidCalendarDate("04-31"), false, "4 月 31 日应被拒");
+	assert.equal(isValidCalendarDate("02-30"), false, "2 月 30 日应被拒");
+	assert.equal(isValidCalendarDate("2026-02-29"), true, "闰年 2 月 29 合法");
+	assert.equal(isValidCalendarDate("01-01"), true);
+	assert.equal(isValidCalendarDate("2026-12-31"), true);
+});
+
+test("v0.7 CLI calendar add 拒绝不存在的日期", async () => {
+	const dir = tmpDir();
+	const path = writeFixture(dir);
+	const { handler } = mountAt(path);
+	const ctx = cmdCtx({ withCustom: false });
+	ctx.ui = { notify: ctx.ui.notify };
+
+	await handler("calendar add bad 坏日期 2026-13-99", ctx);
+	assert.ok(ctx.notifications.at(-1).includes("无效日期"), "应拒绝月份 13");
+	assert.equal(readPricing(path).calendars.bad, undefined, "不得写入非法日历");
+
+	ctx.notifications.length = 0;
+	await handler("calendar add ok 好日期 04-31", ctx);
+	assert.ok(ctx.notifications.at(-1).includes("无效日期"), "应拒绝 4 月 31 日");
 	rmSync(dir, { recursive: true, force: true });
 });

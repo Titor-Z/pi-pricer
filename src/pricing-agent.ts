@@ -1,293 +1,303 @@
 /**
- * AI 辅助配置的服务层：把语义动作作用到 PricingDraft 内存态，产出 diff，
- * 确认后落盘。全链路无 TUI 依赖，可直接单测。
+ * AI 辅助配置服务层：把语义动作落到 Database 事务上，并提供草稿视图。
  *
- * 安全边界（本模块的存在意义）：
- * - agent 只能提交结构化动作，不能整份覆盖 JSON
- * - 所有改动先进内存 draft，validate + 引用保护通过才允许落盘
- * - 落盘走 withFileMutationQueue，与内置 edit/write 共享同一文件队列
+ * 会话模型（整批原子）：
+ * - applyActions(actions)：在**一个长期事务**上依次执行；任一动作失败 → 整批回滚，不做部分提交
+ * - diffPreview()：对比"已提交内存态"与"事务工作副本"，给出人类可读改动预览
+ * - commit()：走 pi 的文件队列 + 校验 + 乐观锁，一次性原子落盘
+ * - discard()：丢弃事务，回到磁盘态
  */
 
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
-import { PricingDraft } from "./pricing-draft.ts";
-import { price, describeSchedule } from "./pricing-desc.ts";
+import { Database, type SaveResult, type Transaction } from "./db/database.ts";
+import {
+	checkCalendarDeletable,
+	checkPlanDeletable,
+	checkRateDeletable,
+	checkRuleDeletable,
+} from "./db/validate.ts";
 import type { PricingAction } from "./pricing-agent-actions.ts";
-import type { PricingPlan, PricingRule, PricingSchema, Schedule } from "./pricing-types.ts";
+import type { CollectionName, PricingSchema } from "./pricing-types.ts";
 
-/** 单个动作的执行结果 */
-export interface ActionOutcome {
-	/** 动作 kind（人读用） */
+/** 单个动作的执行失败信息（整批回滚时返回） */
+export interface ActionFailure {
+	/** 失败动作的 kind */
 	kind: string;
-	/** 动作的简短描述（成功/失败都给出，便于 agent 与用户定位） */
-	summary: string;
-	/** 是否成功 */
-	ok: boolean;
-	/** 失败原因（ok=true 时为空串） */
+	/** 失败原因（中文） */
 	reason: string;
 }
 
-/** applyActions 的汇总结果：失败不中断，逐条记录 */
+/** 批量动作结果 */
 export interface ApplyResult {
-	/** 成功执行的动作描述 */
-	applied: string[];
-	/** 失败的动作与原因 */
-	errors: { action: string; reason: string }[];
-	/** 逐条结果（含成功项，供工具渲染完整审计） */
-	outcomes: ActionOutcome[];
-}
-
-/** 落盘结果 */
-export interface CommitResult {
+	/** 是否全部成功（成功即已进入事务工作副本，尚未落盘） */
 	ok: boolean;
-	reason: string;
+	/** 失败明细（ok=true 时为空数组） */
+	failures: ActionFailure[];
 }
-
-/** 默认时区（与 schema 默认一致） */
-const DEFAULT_TIMEZONE = "Asia/Shanghai";
 
 /**
- * 把动作里的 schedule 字段折叠成完整 Schedule 对象。
- * agent 只需给关心的字段，其余取默认（空 weekdays/ranges = 总是匹配）。
+ * 把单个动作作用到事务工作副本上；失败抛 Error（由调用方汇总并整批回滚）。
+ * 引用一律按 name 解析（LLM 无需知道 _id）。
  */
-function toSchedule(input: {
-	timezone?: string;
-	weekdays?: number[];
-	ranges?: [string, string][];
-	calendar?: string;
-	calendarMode?: "include" | "exclude";
-	includeDates?: string[];
-	excludeDates?: string[];
-}): Schedule {
-	const schedule: Schedule = {
-		timezone: input.timezone?.trim() || DEFAULT_TIMEZONE,
-		weekdays: [...(input.weekdays ?? [])],
-		ranges: (input.ranges ?? []).map(([s, e]) => [s, e] as [string, string]),
-	};
-	if (input.calendar && input.calendarMode) {
-		schedule.calendar = input.calendar;
-		schedule.calendarMode = input.calendarMode;
-	}
-	if (input.includeDates?.length) schedule.includeDates = [...input.includeDates];
-	if (input.excludeDates?.length) schedule.excludeDates = [...input.excludeDates];
-	return schedule;
-}
-
-/** 把 upsertPlan 的规则输入转成 PricingRule */
-function toRule(input: PricingAction & { kind: "upsertPlan" }): (r: (typeof input)["rules"][number]) => PricingRule {
-	return (r) => {
-		const rule: PricingRule = { schedule: toSchedule(r), price: r.price };
-		if (r.validUntil?.trim()) rule.validUntil = r.validUntil.trim();
-		return rule;
-	};
-}
-
-/** 动作 → 人读摘要（成功与失败都用它，避免两套文案） */
-function summarize(action: PricingAction): string {
+export function applyAction(tx: Transaction, action: PricingAction): void {
 	switch (action.kind) {
-		case "setPriceField":
-			return `价格 ${action.priceId} 的 ${action.field} 设为 ${price(action.value)}`;
-		case "upsertPrice":
-			return `价格实体 ${action.priceId}（${action.name}）：miss ${price(action.inputMiss)} / hit ${price(action.inputHit)} / 输出 ${price(action.output)}`;
-		case "upsertPlan":
-			return `方案 ${action.planId}（${action.name}）共 ${action.rules.length} 条规则`;
-		case "setRulePrice":
-			return `方案 ${action.planId} 第 ${action.ruleIndex + 1} 条规则改用价格 ${action.priceId}`;
-		case "bindModel":
-			return `模型 ${action.provider}/${action.model} 绑定方案 ${action.planId}`;
-		case "unbindModel":
-			return `模型 ${action.provider}/${action.model} 解除绑定方案 ${action.planId}`;
-		case "moveBinding":
-			return `模型 ${action.provider}/${action.model} 的绑定 ${action.planId} 移到 ${action.dir}`;
-		case "setAlias":
-			return action.alias.trim() === ""
-				? `模型 ${action.provider}/${action.model} 清除别名`
-				: `模型 ${action.provider}/${action.model} 别名设为 ${action.alias}`;
-		case "upsertCalendar":
-			return `日历 ${action.calendarId}（${action.name}）共 ${action.dates.length} 个日期`;
-		case "addCalendarDates":
-			return `日历 ${action.calendarId} 追加 ${action.dates.length} 个日期`;
+		case "upsertRate": {
+			const existing = tx.rates.findOne((r) => r.name === action.name);
+			if (existing) {
+				tx.rates.updateOne(existing._id, { inputMiss: action.inputMiss, inputHit: action.inputHit, output: action.output });
+			} else {
+				tx.rates.insertOne({ name: action.name, inputMiss: action.inputMiss, inputHit: action.inputHit, output: action.output });
+			}
+			return;
+		}
+		case "deleteRate": {
+			const schema = tx.snapshot();
+			const rate = schema.rates.find((r) => r.name === action.name);
+			if (!rate) throw new Error(`价格「${action.name}」不存在`);
+			const check = checkRateDeletable(schema, rate._id);
+			if (!check.ok) throw new Error(check.reason);
+			tx.rates.deleteOne(rate._id);
+			return;
+		}
+		case "upsertCalendar": {
+			const existing = tx.calendars.findOne((c) => c.name === action.name);
+			const fields = { name: action.name, dates: action.dates, ...(action.region ? { region: action.region } : {}) };
+			if (existing) tx.calendars.updateOne(existing._id, fields);
+			else tx.calendars.insertOne(fields);
+			return;
+		}
+		case "addCalendarDates": {
+			const cal = tx.calendars.findOne((c) => c.name === action.name);
+			if (!cal) throw new Error(`日历「${action.name}」不存在`);
+			tx.calendars.updateOne(cal._id, { dates: [...new Set([...cal.dates, ...action.dates])] });
+			return;
+		}
+		case "deleteCalendar": {
+			const schema = tx.snapshot();
+			const cal = schema.calendars.find((c) => c.name === action.name);
+			if (!cal) throw new Error(`日历「${action.name}」不存在`);
+			const check = checkCalendarDeletable(schema, cal._id);
+			if (!check.ok) throw new Error(check.reason);
+			tx.calendars.deleteOne(cal._id);
+			return;
+		}
+		case "upsertRule": {
+			const schema = tx.snapshot();
+			const rate = schema.rates.find((r) => r.name === action.rateName);
+			if (!rate) throw new Error(`引用的价格「${action.rateName}」不存在，请先创建`);
+			const toIds = (names: string[] | undefined, kind: "日历"): string[] =>
+				(names ?? []).map((name) => {
+					const cal = schema.calendars.find((c) => c.name === name);
+					if (!cal) throw new Error(`引用的${kind}「${name}」不存在，请先创建`);
+					return cal._id;
+				});
+			const fields = {
+				name: action.name,
+				rateId: rate._id,
+				timezone: action.timezone ?? "Asia/Shanghai",
+				weekdays: action.weekdays ?? [],
+				ranges: action.ranges ?? [],
+				includeCalendars: toIds(action.includeCalendars, "日历"),
+				excludeCalendars: toIds(action.excludeCalendars, "日历"),
+				includeDates: action.includeDates ?? [],
+				excludeDates: action.excludeDates ?? [],
+				...(action.validUntil ? { validUntil: action.validUntil } : {}),
+			};
+			const existing = schema.rules.find((r) => r.name === action.name);
+			if (existing) tx.rules.updateOne(existing._id, fields);
+			else tx.rules.insertOne(fields);
+			return;
+		}
+		case "deleteRule": {
+			const schema = tx.snapshot();
+			const rule = schema.rules.find((r) => r.name === action.name);
+			if (!rule) throw new Error(`规则「${action.name}」不存在`);
+			const check = checkRuleDeletable(schema, rule._id);
+			if (!check.ok) throw new Error(check.reason);
+			tx.rules.deleteOne(rule._id);
+			return;
+		}
+		case "upsertPlan": {
+			const schema = tx.snapshot();
+			const ruleIds = (action.ruleNames ?? []).map((name) => {
+				const rule = schema.rules.find((r) => r.name === name);
+				if (!rule) throw new Error(`引用的规则「${name}」不存在，请先创建`);
+				return rule._id;
+			});
+			const existing = schema.plans.find((p) => p.name === action.name);
+			const fields = {
+				name: action.name,
+				enabled: action.enabled ?? true,
+				ruleIds: action.ruleNames === undefined && existing ? existing.ruleIds : ruleIds,
+				...(action.alias ? { alias: action.alias } : {}),
+			};
+			if (existing) tx.plans.updateOne(existing._id, fields);
+			else tx.plans.insertOne(fields);
+			return;
+		}
+		case "setPlanEnabled": {
+			const plan = tx.plans.findOne((p) => p.name === action.name);
+			if (!plan) throw new Error(`方案「${action.name}」不存在`);
+			tx.plans.updateOne(plan._id, { enabled: action.enabled });
+			return;
+		}
+		case "deletePlan": {
+			const schema = tx.snapshot();
+			const plan = schema.plans.find((p) => p.name === action.name);
+			if (!plan) throw new Error(`方案「${action.name}」不存在`);
+			const check = checkPlanDeletable(schema, plan._id);
+			if (!check.ok) throw new Error(check.reason);
+			tx.plans.deleteOne(plan._id);
+			return;
+		}
+		case "bindModel": {
+			const plan = tx.plans.findOne((p) => p.name === action.planName);
+			if (!plan) throw new Error(`方案「${action.planName}」不存在`);
+			const existing = tx.models.findOne((m) => m.provider === action.provider && m.model === action.model);
+			if (existing) tx.models.updateOne(existing._id, { planId: plan._id });
+			else tx.models.insertOne({ provider: action.provider, model: action.model, planId: plan._id });
+			return;
+		}
+		case "unbindModel": {
+			const model = tx.models.findOne((m) => m.provider === action.provider && m.model === action.model);
+			if (!model) throw new Error(`模型 ${action.provider}/${action.model} 未绑定任何方案`);
+			tx.models.deleteOne(model._id);
+			return;
+		}
+		default: {
+			// 穷尽性检查：新增 kind 若漏分发，此处编译期报错
+			const never: never = action;
+			throw new Error(`未知动作：${JSON.stringify(never)}`);
+		}
 	}
 }
 
+/** 各集合的展示名与人类标签（diff 用） */
+const COLLECTION_LABELS: Array<{ key: CollectionName; label: string }> = [
+	{ key: "rates", label: "价格" },
+	{ key: "calendars", label: "日历" },
+	{ key: "rules", label: "规则" },
+	{ key: "plans", label: "方案" },
+	{ key: "models", label: "模型" },
+];
+
+/** 文档的展示名（models 用 provider/model，其余用 name） */
+function documentLabel(doc: Record<string, unknown>): string {
+	if (typeof doc.name === "string") return doc.name;
+	if (typeof doc.provider === "string" && typeof doc.model === "string") return `${doc.provider}/${doc.model}`;
+	return String(doc._id);
+}
+
 /**
- * AI 辅助配置服务：持有 draft，提供 get / apply / diff / commit / discard。
- * 每次构造都从磁盘重读，避免与 TUI 会话交叉污染。
+ * 对比两份 schema，返回人类可读的改动预览。
+ * 同一集合内按 _id 判定 新增 / 删除 / 修改。
  */
+export function diffSchemas(before: PricingSchema, after: PricingSchema): string {
+	const lines: string[] = [];
+	for (const { key, label } of COLLECTION_LABELS) {
+		const beforeDocs = before[key] as unknown as Array<Record<string, unknown>>;
+		const afterDocs = after[key] as unknown as Array<Record<string, unknown>>;
+		const beforeMap = new Map(beforeDocs.map((d) => [String(d._id), d]));
+		const afterMap = new Map(afterDocs.map((d) => [String(d._id), d]));
+		const added = afterDocs.filter((d) => !beforeMap.has(String(d._id)));
+		const removed = beforeDocs.filter((d) => !afterMap.has(String(d._id)));
+		const changed = afterDocs.filter((d) => {
+			const prev = beforeMap.get(String(d._id));
+			return prev !== undefined && JSON.stringify(prev) !== JSON.stringify(d);
+		});
+		for (const doc of added) lines.push(`＋ ${label}：${documentLabel(doc)}`);
+		for (const doc of removed) lines.push(`－ ${label}：${documentLabel(doc)}`);
+		for (const doc of changed) lines.push(`～ ${label}：${documentLabel(doc)}`);
+	}
+	return lines.length > 0 ? lines.join("\n") : "（无改动）";
+}
+
+/** 现状摘要（供 price_get） */
+export function describeSchema(schema: PricingSchema): string {
+	const names = (docs: Array<{ name: string }>): string => (docs.length > 0 ? docs.map((d) => d.name).join("、") : "（空）");
+	const models = schema.models.map((m) => `${m.provider}/${m.model}`).join("、");
+	return [
+		`价格表（${schema.rates.length}）：${names(schema.rates)}`,
+		`日历表（${schema.calendars.length}）：${names(schema.calendars)}`,
+		`规则表（${schema.rules.length}）：${names(schema.rules)}`,
+		`方案表（${schema.plans.length}）：${names(schema.plans)}`,
+		`模型绑定（${schema.models.length}）：${models || "（空）"}`,
+	].join("\n");
+}
+
+/** AI 辅助配置服务：持有长期事务作为草稿 */
 export class PricingAgentService {
-	/** 内存编辑会话（复用 TUI 同款 draft：validate + 引用保护） */
-	private readonly draft: PricingDraft;
+	/** 已打开的数据库（惰性） */
+	private database: Database | null = null;
+	/** 当前草稿事务（null = 无未保存改动） */
+	private draft: Transaction | null = null;
 
-	constructor(private readonly filePath?: string) {
-		this.draft = new PricingDraft(filePath);
-	}
+	constructor(private readonly filePath?: string) {}
 
-	/** 当前配置的语义摘要（agent 读取现有结构用） */
-	getSummary(): string {
-		const data = this.draft.snapshot();
-		const lines: string[] = [];
-		lines.push(`配置文件：${this.filePath ?? "~/.pi/model-pricing.json"}`);
-		lines.push(`价格实体：${this.listKeys(data.prices)}`);
-		lines.push(`方案：${this.listKeys(data.plans)}`);
-		lines.push(`日历：${this.listKeys(data.calendars)}`);
-		lines.push("");
-		lines.push(this.describeProviders(data));
-		return lines.join("\n");
-	}
-
-	/** 当前配置全量（agent 需要精确结构时用） */
-	getSnapshot(): PricingSchema {
-		return this.draft.snapshot();
+	/** 取数据库（惰性打开，保持乐观锁基线一致） */
+	private db(): Database {
+		if (!this.database) this.database = Database.open(this.filePath);
+		return this.database;
 	}
 
 	/** 是否有未保存改动 */
-	get isDirty(): boolean {
-		return this.draft.isDirty;
+	get hasPending(): boolean {
+		return this.draft !== null;
+	}
+
+	/** 现状摘要 */
+	getSummary(): string {
+		return describeSchema(this.db().snapshot());
 	}
 
 	/**
-	 * 批量应用语义动作。单条失败不中断，最后汇总。
-	 * 这样 agent 一次提交多个动作时能拿到完整反馈，而不是只看到第一条错误。
+	 * 应用一组动作（整批原子）：
+	 * 任一动作失败 → 丢弃本批全部改动（含此前未提交的草稿），返回失败明细。
 	 */
 	applyActions(actions: PricingAction[]): ApplyResult {
-		const outcomes: ActionOutcome[] = [];
+		const failures: ActionFailure[] = [];
+		const tx = this.draft ?? (this.draft = this.db().begin());
 		for (const action of actions) {
-			outcomes.push(this.applyOne(action));
-		}
-		return {
-			applied: outcomes.filter((o) => o.ok).map((o) => o.summary),
-			errors: outcomes.filter((o) => !o.ok).map((o) => ({ action: o.summary, reason: o.reason })),
-			outcomes,
-		};
-	}
-
-	/** 单条动作分发：每个 kind 对应一个 draft mutator */
-	private applyOne(action: PricingAction): ActionOutcome {
-		const base = { kind: action.kind, summary: summarize(action) };
-		switch (action.kind) {
-			case "setPriceField": {
-				const ok = this.draft.setPriceField(action.priceId, action.field, action.value);
-				return { ...base, ok, reason: ok ? "" : `价格实体 "${action.priceId}" 不存在` };
-			}
-			case "upsertPrice": {
-				const ok = this.draft.upsertPrice(action.priceId, {
-					name: action.name,
-					input: { miss: action.inputMiss, hit: action.inputHit },
-					output: action.output,
-				});
-				return { ...base, ok, reason: ok ? "" : "价格实体 id 不能为空" };
-			}
-			case "upsertPlan": {
-				const plan: PricingPlan = { name: action.name, rules: action.rules.map(toRule(action)) };
-				const ok = this.draft.upsertPlan(action.planId, plan);
-				return { ...base, ok, reason: ok ? "" : "方案 id 不能为空" };
-			}
-			case "setRulePrice": {
-				const ok = this.draft.setRulePrice(action.planId, action.ruleIndex, action.priceId);
-				return { ...base, ok, reason: ok ? "" : `方案 "${action.planId}" 第 ${action.ruleIndex + 1} 条规则或价格 "${action.priceId}" 不存在` };
-			}
-			case "bindModel": {
-				const ok = this.draft.addBinding(action.provider, action.model, action.planId);
-				return { ...base, ok, reason: ok ? "" : `模型 "${action.provider}/${action.model}" 或方案 "${action.planId}" 不存在（或已绑定且启用）` };
-			}
-			case "unbindModel": {
-				const ok = this.draft.removeBinding(action.provider, action.model, action.planId);
-				return { ...base, ok, reason: ok ? "" : `模型 "${action.provider}/${action.model}" 未绑定方案 "${action.planId}"` };
-			}
-			case "moveBinding": {
-				const ok = this.draft.moveBinding(action.provider, action.model, action.planId, action.dir);
-				return { ...base, ok, reason: ok ? "" : `模型 "${action.provider}/${action.model}" 未绑定方案 "${action.planId}"` };
-			}
-			case "setAlias": {
-				const ok = this.draft.setAlias(action.provider, action.model, action.alias);
-				return { ...base, ok, reason: ok ? "" : `模型 "${action.provider}/${action.model}" 不存在` };
-			}
-			case "upsertCalendar": {
-				const ok = this.draft.upsertCalendar(action.calendarId, { name: action.name, dates: [...action.dates] });
-				return { ...base, ok, reason: ok ? "" : "日历 id 不能为空" };
-			}
-			case "addCalendarDates": {
-				const ok = this.draft.addCalendarDates(action.calendarId, action.dates);
-				return { ...base, ok, reason: ok ? "" : `日历 "${action.calendarId}" 不存在` };
+			try {
+				applyAction(tx, action);
+			} catch (error) {
+				failures.push({ kind: action.kind, reason: error instanceof Error ? error.message : String(error) });
 			}
 		}
+		if (failures.length > 0) {
+			// 整批原子：回滚包括之前累积的草稿，避免留下"成功一半"的状态
+			tx.rollback();
+			this.draft = null;
+			return {
+				ok: false,
+				failures: [
+					...failures,
+					{ kind: "batch", reason: "本批动作未生效：任一动作失败即整批回滚，请修正后重试" },
+				],
+			};
+		}
+		return { ok: true, failures: [] };
 	}
 
-	/** 未保存改动的面（状态栏/报告用） */
-	get changedAreas(): string[] {
-		return this.draft.changedAreas;
-	}
-
-	/**
-	 * 人类可读的改动预览（改前 vs 改后对比）。
-	 * 无改动时返回提示文案。
-	 */
+	/** 未保存改动的可读预览 */
 	diffPreview(): string {
-		if (!this.draft.isDirty) return "当前没有未保存的改动。";
-		const after = this.draft.snapshot();
-		const lines: string[] = [`将要写入的文件：${this.filePath ?? "~/.pi/model-pricing.json"}`, ""];
-		lines.push(`涉及面：${this.draft.changedAreas.join("、")}`);
-		lines.push("");
-		lines.push("改动后的配置：");
-		lines.push(this.describeProviders(after));
-		return lines.join("\n");
+		if (!this.draft) return "（无未保存改动）";
+		return diffSchemas(this.db().snapshot(), this.draft.snapshot());
 	}
 
-	/**
-	 * 落盘：先跑 draft 的 validate + 引用保护，通过才写。
-	 * 写操作走 withFileMutationQueue，避免与内置 edit/write 并发覆盖。
-	 */
-	async commit(): Promise<CommitResult> {
-		const result = await withFileMutationQueue(this.filePath ?? "", async () => this.draft.save());
-		return { ok: result.ok, reason: result.reason };
+	/** 落盘：经 pi 文件队列 + 校验 + 乐观锁，一次性原子写 */
+	async commit(): Promise<SaveResult> {
+		if (!this.draft) return { ok: false, reason: "没有待保存的改动" };
+		const tx = this.draft;
+		const result = await withFileMutationQueue(this.db().filePath, async () => tx.commit());
+		if (result.ok) this.draft = null;
+		return result;
 	}
 
-	/** 丢弃全部未保存改动（从磁盘重读） */
+	/** 丢弃草稿（回到磁盘态） */
 	discard(): void {
-		this.draft.reset();
-	}
-
-	/** 渲染厂商 → 模型 → 绑定 → 规则（get/diff 共用，保证两处文案一致） */
-	private describeProviders(data: PricingSchema): string {
-		const lines: string[] = [];
-		for (const [provId, prov] of Object.entries(data.providers)) {
-			lines.push(`[${provId}]`);
-			for (const [modelId, conf] of Object.entries(prov.models)) {
-				const alias = conf.alias ? `（别名 ${conf.alias}）` : "";
-				lines.push(`  ${modelId}${alias}`);
-				for (const [index, binding] of conf.plans.entries()) {
-					const state = binding.enabled ? "启用" : "停用";
-					lines.push(`    #${index + 1} [${state}] ${binding.plan}`);
-				}
-			}
-		}
-		lines.push("");
-		lines.push("方案规则：");
-		lines.push(this.describePlans(data));
-		return lines.join("\n");
-	}
-
-	/** 渲染所有方案的规则（含价格数值与时间条件） */
-	private describePlans(data: PricingSchema): string {
-		const lines: string[] = [];
-		for (const [planId, plan] of Object.entries(data.plans)) {
-			lines.push(`· ${planId}（${plan.name}）`);
-			for (const [index, rule] of plan.rules.entries()) {
-				lines.push(`    ${index + 1}. ${describeSchedule(rule.schedule)} → ${this.describePrice(data, rule)}`);
-			}
-		}
-		return lines.join("\n");
-	}
-
-	/** 规则引用的价格实体渲染（价格缺失时给出显式警告，便于 agent 自纠） */
-	private describePrice(data: PricingSchema, rule: PricingRule): string {
-		const entity = data.prices[rule.price];
-		if (!entity) return `${rule.price}（⚠ 价格实体不存在）`;
-		return `${rule.price}：miss ${price(entity.input.miss)} / hit ${price(entity.input.hit)} / 输出 ${price(entity.output)}`;
-	}
-
-	/** 注册表 key 渲染（空表给出明确文案） */
-	private listKeys(record: Record<string, unknown>): string {
-		const keys = Object.keys(record);
-		return keys.length > 0 ? keys.join("、") : "（空）";
+		if (this.draft) this.draft.rollback();
+		this.draft = null;
+		this.database = null; // 下次访问重新读盘，保证与磁盘一致
 	}
 }

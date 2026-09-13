@@ -1,103 +1,132 @@
 ---
 name: price-config
-description: Configure pi's model pricing (model-pricing.json) from a price list, bill, invoice, or documentation the user provides. Use when the user gives you pricing data or asks you to change how a model is billed (peak/off-peak prices, holiday calendars, plan bindings). Requires the user to have run /price ai first.
+description: Configure pi's model pricing (model-pricing.json) from a price list, bill, invoice, or documentation the user provides. Use when the user gives you pricing data or asks you to change how a model is billed (prices, holiday calendars, rules, plans, model bindings). Requires the user to have run /price ai first.
 ---
 
-# 模型计费配置（AI 辅助）
+# 模型计费配置（AI 辅助，schema v5）
 
 帮用户把价格资料（网页文本、账单、价目表、截图里的文字）落成 pi 的计费配置。
 
 ## 前置条件
 
 **必须先让用户执行 `/price ai` 启用 AI 编辑模式**（本次会话内有效）。
-未启用时 `price_*` 工具不在可用工具列表中；如果调用返回"未启用"提示，
-说明用户还没执行 `/price ai`，请明确告诉用户先执行该命令，不要自己想办法绕过。
+未启用时 `price_*` 工具不在可用工具列表中；若调用返回"未启用"提示，
+请明确告诉用户先执行该命令，不要自己想办法绕过。
 
 ## 硬性禁止
 
 - **禁止**用 `edit` / `write` / `bash` 直接修改 `~/.pi/model-pricing.json`。
-  直接改文件会绕过校验和引用保护，可能让配置进入损坏状态。
-  所有改动一律走 `price_apply`。
+  直接改文件会绕过校验与引用保护。所有改动一律走 `price_apply`。
 - **禁止猜测**。价格、日期、时段、星期、时区、模型名、厂商名——任何一项资料里
   没写清楚，都要问用户，不要填一个"看起来合理"的值。
-- **禁止**在用户没确认前调用 `price_save` 之外的落盘手段。落盘只能通过 `price_save`。
+- **禁止**在用户确认前落盘。落盘只能通过 `price_save`。
 
-## 工作流
+## 数据模型（五张表，靠 name 互相引用）
 
-1. **读现状**：调用 `price_get`，看清现有的价格实体、方案、规则、日历、模型绑定。
-   注意现有 id 命名习惯（如 `ds-v4-pro-peak`），新增时保持一致风格。
-2. **解析资料**：把用户给的资料整理成结构化字段——厂商、模型名、价格数值、
-   适用时间条件。单位统一为 **¥ / 百万 token**；如果资料是别的单位（如 ¥/千 token），
-   先换算并告知用户换算结果。
-3. **补齐缺失信息**：资料里没有的（时区、星期、节假日日历等）问用户，不要默认。
-   只有时区可以合理默认 `Asia/Shanghai`，但也要在报告中说明。
-4. **应用改动**：调用 `price_apply`，传一组语义动作。先建被引用的实体
-   （价格实体 / 日历），再建方案，最后做绑定——因为方案规则会引用价格和日历。
-5. **让用户确认**：调用 `price_review`，把改动预览展示给用户。
-6. **落盘**：用户看过之后调用 `price_save`。首次保存会弹确认框，属正常流程。
-   保存被拒绝时（引用不存在的价格/日历等），按返回原因修正后重试，不要强行落盘。
-7. **报告**：告诉用户改了哪几个实体（价格/方案/规则/绑定/日历），以及落盘结果。
+| 表 | 作用 | 关键字段 |
+|---|---|---|
+| **价格 rate** | 只声明数值，不含任何时间条件 | `name`（唯一）, `inputMiss`, `inputHit`, `output` |
+| **日历 calendar** | 命名日期资源（法定/民俗/促销日） | `name`（唯一）, `dates`（`YYYY-MM-DD` 或 `MM-DD`） |
+| **规则 rule** | 时间条件 + 一个价格引用 | `name`（唯一）, `rateName`, `timezone`, `weekdays`, `ranges`, `includeCalendars`, `excludeCalendars`, `includeDates`, `excludeDates`, `validUntil` |
+| **方案 plan** | 规则组，模型唯一对接对象 | `name`（唯一）, `alias`, `enabled`, `ruleNames` |
+| **模型 model** | 厂商 + 模型名 + 绑定的方案 | `provider`, `model`, `planName` |
+
+**动作里引用实体一律用 `name`（唯一），不要用 `_id`。**
+
+### 规则的匹配语义
+
+一条规则在"各条件的**交集**"内生效：
+
+1. `validUntil` 过期 → 不生效
+2. 命中 `excludeDates` / `excludeCalendars` → 不生效（排除优先）
+3. 若给了 `includeCalendars`，日期必须在其中某个日历里
+4. 若给了 `includeDates`，日期必须命中
+5. `weekdays` 为空 = 任意星期；否则需命中（1=周一…7=周日）
+6. `ranges` 为空 = 全天；否则需落在某个 `["HH:MM","HH:MM")` 内
+
+### 规则优先级（重要）
+
+同一方案内，**后创建的规则覆盖先创建的规则**（交集处覆盖，互不影响处各自生效）。
+因此：**先建兜底规则（如"全时谷价"），后建特例规则（如"工作日高峰"）**，
+特例才能在重叠时段胜出。
 
 ## 格式规范
 
-| 字段 | 格式 | 说明 |
-|---|---|---|
-| 价格 | number | ¥/百万 token，非负 |
-| 日期（日历） | `YYYY-MM-DD` 或 `MM-DD` | `MM-DD` = 每年循环（节假日用这个） |
-| 日期（有效期/指定/排除） | `YYYY-MM-DD` | 精确日期 |
-| 时段 | `["HH:MM", "HH:MM"]` | 半开区间，含头不含尾；跨天拆成两段 |
-| 星期 | 1–7 | 1=周一 … 7=周日；空数组 = 任意星期 |
-| 时区 | IANA 名 | 如 `Asia/Shanghai` |
+| 字段 | 格式 |
+|---|---|
+| 价格 | number，¥/百万 token，非负 |
+| 日期 | `YYYY-MM-DD`（精确）或 `MM-DD`（每年循环，节假日用这个） |
+| 时段 | `["HH:MM","HH:MM"]` 半开区间，含头不含尾；跨天拆两段 |
+| 星期 | 1–7（1=周一）；空数组 = 任意 |
+| 时区 | IANA 名，如 `Asia/Shanghai`；不填默认 `Asia/Shanghai` |
 
-**空 weekdays + 空 ranges = 永远匹配（基准价）**。规则数组顺序 = 优先级，先匹配先生效。
+## 工作流
 
-## 常见场景
+1. **读现状**：`price_get`，看清现有价格/日历/规则/方案/模型，注意命名习惯。
+2. **解析资料**：整理成结构化字段；单位统一为 ¥/百万 token，若资料是别的单位先换算并告知。
+3. **补齐缺失**：资料没有的（时区、星期、日历等）问用户；只有时区可默认 `Asia/Shanghai` 并说明。
+4. **应用改动**：`price_apply` 一次传完整一批动作，顺序为
+   **先价格/日历 → 再规则 → 再方案 → 最后绑模型**（被引用的先建）。
+   调用顺序按创建时间：同一方案内先兜底规则、后特例规则。
+5. **确认**：`price_review`，把改动预览给用户看。
+6. **落盘**：用户确认后 `price_save`。保存被拒时按原因修正后重试。
+7. **报告**：说明改了哪些实体与落盘结果。
 
-### 场景一：改某模型的峰/谷价
+## 可用动作（price_apply 的 actions）
 
-资料："deepseek-v4-pro 高峰（工作日 9-12、14-18）输入 27 / 输出 54，
-其余时间输入 13.5 / 输出 27，缓存命中均为输入价的一半"
+`upsertRate` / `deleteRate` / `upsertCalendar` / `addCalendarDates` / `deleteCalendar` /
+`upsertRule` / `deleteRule` / `upsertPlan` / `setPlanEnabled` / `deletePlan` /
+`bindModel` / `unbindModel`
+
+- `upsert*` 按 `name` 定位：不存在则新建，存在则覆盖所给字段。
+- 一批动作**整批原子**：任一动作失败则整批回滚，需修正后整批重发。
+
+## 场景示例
+
+### 一、某模型的峰/谷价
+
+资料："deepseek-v4-pro 工作日 9-12、14-18 输出 27 输入 9，其余时间输出 13.5 输入 4.5，缓存命中为输入的三折"
 
 ```
-1. price_get → 看现有 deepseek 的模型与方案绑定
-2. price_apply:
-   - upsertPrice  ds-v4-pro-peak   { inputMiss: 27, output: 54, inputHit: 13.5 }
-   - upsertPrice  ds-v4-pro-off    { inputMiss: 13.5, output: 27, inputHit: 6.75 }
-   - upsertPlan   ds-v4-pro        { rules: [
-       { price: "ds-v4-pro-peak", weekdays: [1,2,3,4,5], ranges: [["09:00","12:00"],["14:00","18:00"]] },
-       { price: "ds-v4-pro-off" }   // 兜底：空 conditions = 永远匹配
-     ] }
-   - bindModel    deepseek / deepseek-v4-pro → ds-v4-pro
-3. price_review → 给用户看
-4. price_save
+price_apply actions:
+  1. upsertRate  { name: "Pro 谷价", inputMiss: 4.5,  inputHit: 1.35, output: 13.5 }
+  2. upsertRate  { name: "Pro 峰价", inputMiss: 9,    inputHit: 2.7,  output: 27 }
+  3. upsertRule  { name: "Pro 全时谷价", rateName: "Pro 谷价" }                          // 兜底，先建
+  4. upsertRule  { name: "Pro 工作日高峰", rateName: "Pro 峰价",
+                   weekdays: [1,2,3,4,5], ranges: [["09:00","12:00"],["14:00","18:00"]] } // 特例，后建
+  5. upsertPlan  { name: "deepseek-v4-pro 方案", alias: "Pro", ruleNames: ["Pro 全时谷价", "Pro 工作日高峰"] }
+  6. bindModel   { provider: "deepseek", model: "deepseek-v4-pro", planName: "deepseek-v4-pro 方案" }
 ```
 
-### 场景二：加一个节假日日历，并让高峰规则在节假日失效
+### 二、节假日日历 + 节假日不按峰价
 
 资料："中国法定节假日：元旦 1-1，国庆 10-1 到 10-7"
 
 ```
-1. price_apply:
-   - upsertCalendar cn-holiday { name: "中国法定节假日",
-       dates: ["01-01", "10-01", "10-02", "10-03", "10-04", "10-05", "10-06", "10-07"] }
-2. price_get 找到需要引用它的方案与规则下标
-3. price_apply:
-   - upsertPlan（或 setRulePrice 前先看现规则）
-     把该规则 schedule 设为 { ..., calendar: "cn-holiday", calendarMode: "exclude" }
-4. price_review → price_save
+price_apply actions:
+  1. upsertCalendar { name: "中国法定节假日",
+                      dates: ["01-01","10-01","10-02","10-03","10-04","10-05","10-06","10-07"] }
+  2. upsertRule     { name: "Pro 工作日高峰（排除节假日）", rateName: "Pro 峰价",
+                      weekdays: [1,2,3,4,5], ranges: [["09:00","12:00"],["14:00","18:00"]],
+                      excludeCalendars: ["中国法定节假日"] }   // 同名覆盖，追加排除
 ```
 
-引用日历时必须同时给 `calendar` 和 `calendarMode`（`include` = 仅这些日期生效；
-`exclude` = 这些日期不生效）。
+引用日历时给日历的 `name`。
+
+### 三、节假日专属低价
+
+```
+price_apply actions:
+  1. upsertCalendar { name: "促销日", dates: ["2026-11-11"] }
+  2. upsertRule     { name: "双十一促销", rateName: "促销价", includeCalendars: ["促销日"] }  // 后建 → 覆盖
+```
 
 ## 出错时怎么办
 
-`price_apply` 返回的失败项会带原因（如"价格实体 X 不存在"）。常见自纠：
+`price_apply` 失败会整批回滚并返回每条原因。常见自纠：
 
-- **引用的实体不存在**：先创建它，或在同一批动作里把它排在引用者之前。
-- **模型/厂商不存在**：确认用户的模型名与配置里的 key 是否一致；
-  不一致就问用户，不要新建厂商条目来"接住"错名字。
-- **保存被拒（引用完整性）**：说明某个方案/规则引用了不存在的价格或日历，
-  按原因补建或改正引用后重试。
+- **引用的实体不存在**：同一批里把被引用者（价格/日历/规则）排在引用者之前。
+- **name 重复**：同名 `upsert*` 会覆盖而非新建；若想新建请换一个名字。
+- **保存被拒（引用完整性 / 乐观锁）**：按原因修正；乐观锁冲突说明文件被外部改过，让用户重开或重新读取。
 
 任何一步不确定，停下来问用户。宁可少改，不可乱改。

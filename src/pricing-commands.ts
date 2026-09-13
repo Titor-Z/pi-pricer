@@ -1,545 +1,760 @@
 /**
- * /price 命令实现：v2 五注册表浏览 + 管理面 CRUD。
+ * /price 命令实现（v5）：6 个子命令 = 无参 / rate / calendar / rule / plan / ai。
  *
- * 接线层：pi.registerCommand → pricing-ui（抽屉）+ pricing-store +
- * pricing-query + pricing-format。编辑主链路在 TUI 抽屉（draft + Ctrl+S 保存），
- * CLI 提供等价能力（headless 可完整操作）：查询/管理面 CRUD。
+ * 职责：管理规则制定与存储（CRUD），不展示"当前什么价"（那是 pi-usager 的事）。
+ * 所有写操作走 Database.transaction（校验 + 乐观锁 + 原子写，失败整笔回滚）。
+ * 支持 filePath 注入，便于单测隔离。
  */
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { seedPricing, updatePricing, readPricing, checkPlanDeletable, checkPriceDeletable } from "./pricing-store.ts";
+import { Database } from "./db/database.ts";
 import {
-	renderPriceList,
-	renderModelDetail,
-	renderPlanList,
-	renderPlanDetail,
-	renderPriceRegistry,
-	renderCalendarList,
-	renderHelp,
-} from "./pricing-format.ts";
-import { PricingDrawer, isValidCalendarDate } from "./pricing-ui.ts";
-import { PRICE_SUBCOMMANDS, findSubcommand, PRICE_FIELDS } from "./pricing-cli-spec.ts";
-import { PricingAgentTools, PRICING_AGENT_TOOL_NAMES } from "./pricing-agent-tool.ts";
-import type { AutocompleteItem } from "@earendil-works/pi-tui";
-import type { PricingSchema } from "./pricing-types.ts";
+	checkCalendarDeletable,
+	checkPlanDeletable,
+	checkRateDeletable,
+	checkRuleDeletable,
+} from "./db/validate.ts";
+import type {
+	CalendarDoc,
+	ModelDoc,
+	PlanDoc,
+	PricingSchema,
+	RateDoc,
+	RuleDoc,
+} from "./pricing-types.ts";
+import {
+	PRICE_AI_TOOL_NAMES,
+	PRICE_SUBCOMMANDS,
+	RATE_FIELDS,
+	findSubcommand,
+} from "./pricing-cli-spec.ts";
+import type { PricingAgentTools } from "./pricing-agent-tool.ts";
+import { openPricingDrawer, type DrawerPage } from "./tui/pricing-drawer.ts";
 
-/** 格式化价格值：支持 "4"、"4.5"、"¥4" 等输入 → 解析为 number */
-function parsePriceValue(raw: string): number | null {
-	const cleaned = raw.replace(/^¥/, "").trim();
-	const num = Number(cleaned);
-	if (!Number.isFinite(num) || num < 0) return null;
-	return num;
+/** 补全项（与 pi-tui AutocompleteItem 同形，避免直接依赖其类型） */
+export interface CompletionItem {
+	value: string;
+	label: string;
+	description?: string;
 }
 
-/** 解析价格字段路径：input.miss / input.hit / output */
-function parsePriceField(field: string): "input.miss" | "input.hit" | "output" | null {
-	if (field === "input.miss" || field === "input.hit" || field === "output") return field;
-	return null;
-}
+// ── 解析辅助 ──────────────────────────────────────────────────────────────
 
-/** 修改价格实体字段值 */
-function setPriceField(p: { input: { miss: number; hit: number }; output: number }, field: "input.miss" | "input.hit" | "output", value: number): void {
-	switch (field) {
-		case "input.miss": p.input.miss = value; break;
-		case "input.hit": p.input.hit = value; break;
-		case "output": p.output = value; break;
+/** 分词：按空白切分，双引号包裹的片段保持整体（支持 name 含空格） */
+function tokenize(input: string): string[] {
+	const out: string[] = [];
+	let current = "";
+	let quoted = false;
+	for (const ch of input) {
+		if (ch === "\"") {
+			quoted = !quoted;
+			continue;
+		}
+		if (!quoted && /\s/.test(ch)) {
+			if (current !== "") out.push(current);
+			current = "";
+			continue;
+		}
+		current += ch;
 	}
+	if (current !== "") out.push(current);
+	return out;
 }
 
+/** 解析结果：位置参数 + 具名选项（同名选项可重复，便于多个日历/日期） */
+interface ParsedArgs {
+	positionals: string[];
+	flags: Map<string, string[]>;
+}
+
+/** 解析 `--key value` 选项与位置参数 */
+function parseArgs(tokens: string[]): ParsedArgs {
+	const positionals: string[] = [];
+	const flags = new Map<string, string[]>();
+	for (let i = 0; i < tokens.length; i += 1) {
+		const token = tokens[i];
+		if (!token.startsWith("--")) {
+			positionals.push(token);
+			continue;
+		}
+		const key = token.slice(2);
+		const next = tokens[i + 1];
+		if (next === undefined || next.startsWith("--")) {
+			flags.set(key, [...(flags.get(key) ?? [])]);
+			continue;
+		}
+		flags.set(key, [...(flags.get(key) ?? []), next]);
+		i += 1;
+	}
+	return { positionals, flags };
+}
+
+/** 取布尔型选项值（`--key v` 的首个值） */
+function flagValue(flags: ParsedArgs["flags"], key: string): string | undefined {
+	return flags.get(key)?.[0];
+}
+
+/** 展开逗号/空白分隔的多值选项 */
+function flagList(flags: ParsedArgs["flags"], key: string): string[] {
+	return (flags.get(key) ?? []).flatMap((v) => v.split(",").map((s) => s.trim()).filter((s) => s !== ""));
+}
+
+/** 解析星期表达式："1-5" / "1,3,5" / "7" → [1,2,3,4,5] 等 */
+function parseWeekdays(expr: string): number[] {
+	const out = new Set<number>();
+	for (const part of expr.split(",").map((s) => s.trim()).filter((s) => s !== "")) {
+		const range = /^(\d)-(\d)$/.exec(part);
+		if (range) {
+			for (let d = Number(range[1]); d <= Number(range[2]); d += 1) out.add(d);
+			continue;
+		}
+		if (/^[1-7]$/.test(part)) out.add(Number(part));
+	}
+	return [...out].sort((a, b) => a - b);
+}
+
+/** 解析时段："09:00-12:00,14:00-18:00" → [["09:00","12:00"],["14:00","18:00"]] */
+function parseRanges(expr: string): [string, string][] {
+	return expr
+		.split(",")
+		.map((s) => s.trim())
+		.filter((s) => s !== "")
+		.map((part) => {
+			const m = /^(\d{2}:\d{2})-(\d{2}:\d{2})$/.exec(part);
+			if (!m) throw new Error(`时段格式非法："${part}"（应为 HH:MM-HH:MM）`);
+			return [m[1], m[2]] as [string, string];
+		});
+}
+
+/** 解析日期列表："01-01,10-01" 或 "01-01 10-01" */
+function parseDates(expr: string): string[] {
+	return expr.split(/[,\s]+/).map((s) => s.trim()).filter((s) => s !== "");
+}
+
+/** 名称含空白时补全值需加引号 */
+function quoteIfNeeded(value: string): string {
+	return /\s/.test(value) ? `"${value}"` : value;
+}
+
+// ── 渲染（headless 文本） ─────────────────────────────────────────────────
+
+/** 填充到指定显示宽度（按字符数，够用即可） */
+function pad(text: string, width: number): string {
+	const length = [...text].length;
+	return length >= width ? text : text + " ".repeat(width - length);
+}
+
+/** 模型列表：有方案的模型，按 (provider, model) 字母序 */
+export function renderModelList(schema: PricingSchema): string {
+	if (schema.models.length === 0) return "尚无模型绑定方案。用 /price plan bind <provider> <model> <planName> 绑定。";
+	const lines = ["模型计费配置（已设定方案的模型 · 字母序）", ""];
+	const ordered = [...schema.models].sort((a, b) =>
+		`${a.provider}/${a.model}`.localeCompare(`${b.provider}/${b.model}`),
+	);
+	const width = Math.max(...ordered.map((m) => `${m.provider}/${m.model}`.length));
+	for (const model of ordered) {
+		const plan = schema.plans.find((p) => p._id === model.planId);
+		const state = plan?.enabled ? "启用" : plan ? "已禁用" : "方案缺失";
+		const alias = plan?.alias ? `（${plan.alias}）` : "";
+		const label = `${model.provider}/${model.model}`;
+		lines.push(`  ${pad(label, width)}  → ${plan?.name ?? model.planId}${alias}  [${state}]`);
+	}
+	return lines.join("\n");
+}
+
+/** 价格表 */
+export function renderRateList(schema: PricingSchema): string {
+	if (schema.rates.length === 0) return "价格表为空。用 /price rate add <name> <miss> <hit> <output> 新建。";
+	const lines = ["价格表", ""];
+	const width = Math.max(...schema.rates.map((r) => [...r.name].length));
+	for (const rate of schema.rates) {
+		lines.push(`  ${pad(rate.name, width)}  未命中 ${rate.inputMiss} · 命中 ${rate.inputHit} · 输出 ${rate.output}`);
+	}
+	return lines.join("\n");
+}
+
+/** 日历表（含被哪些规则引用） */
+export function renderCalendarList(schema: PricingSchema): string {
+	if (schema.calendars.length === 0) return "日历表为空。用 /price calendar add <name> \"<日期...>\" 新建。";
+	const lines = ["日历表", ""];
+	for (const cal of schema.calendars) {
+		const usedBy = referencedRuleNames(schema, cal._id, "calendar");
+		const refs = usedBy.length > 0 ? `  ← ${usedBy.join("、")}` : "";
+		lines.push(`  ${cal.name}（${cal.dates.length} 个日期）${refs}`);
+		lines.push(`    ${cal.dates.join(", ")}`);
+	}
+	return lines.join("\n");
+}
+
+/** 规则表（含被哪些方案引用） */
+export function renderRuleList(schema: PricingSchema): string {
+	if (schema.rules.length === 0) return "规则表为空。用 /price rule add <name> <rateName> 新建。";
+	const lines = ["规则表", ""];
+	for (const rule of schema.rules) {
+		const rate = schema.rates.find((r) => r._id === rule.rateId);
+		const usedBy = schema.plans.filter((p) => p.ruleIds.includes(rule._id)).map((p) => p.name);
+		const refs = usedBy.length > 0 ? `  ← ${usedBy.join("、")}` : "";
+		lines.push(`  ${rule.name}  → 价格「${rate?.name ?? rule.rateId}」${refs}`);
+		lines.push(`    ${describeRule(rule, schema)}`);
+	}
+	return lines.join("\n");
+}
+
+/** 方案表（含引用它的模型） */
+export function renderPlanList(schema: PricingSchema): string {
+	if (schema.plans.length === 0) return "方案表为空。用 /price plan add <name> 新建。";
+	const lines = ["方案表", ""];
+	for (const plan of schema.plans) {
+		const models = schema.models.filter((m) => m.planId === plan._id).map((m) => `${m.provider}/${m.model}`);
+		const state = plan.enabled ? "启用" : "已禁用";
+		const alias = plan.alias ? `（${plan.alias}）` : "";
+		lines.push(`  ${plan.name}${alias}  [${state}]  ${plan.ruleIds.length} 条规则`);
+		if (models.length > 0) lines.push(`    ← ${models.join("、")}`);
+	}
+	return lines.join("\n");
+}
+
+/** 规则的中文摘要（时间条件 + 时效） */
+function describeRule(rule: RuleDoc, schema: PricingSchema): string {
+	const parts: string[] = [];
+	parts.push(rule.weekdays.length > 0 ? `周 ${rule.weekdays.join(",")}` : "每天");
+	const ranges = rule.ranges.length > 0 ? rule.ranges.map(([s, e]) => `${s}-${e}`).join(" / ") : "全天";
+	parts.push(ranges);
+	if (rule.includeCalendars.length > 0) {
+		parts.push(`仅 ${rule.includeCalendars.map((id) => schema.calendars.find((c) => c._id === id)?.name ?? id).join("、")}`);
+	}
+	if (rule.excludeCalendars.length > 0) {
+		parts.push(`排除 ${rule.excludeCalendars.map((id) => schema.calendars.find((c) => c._id === id)?.name ?? id).join("、")}`);
+	}
+	if (rule.includeDates.length > 0) parts.push(`指定日期 ${rule.includeDates.join("、")}`);
+	if (rule.excludeDates.length > 0) parts.push(`排除日期 ${rule.excludeDates.join("、")}`);
+	if (rule.validUntil) parts.push(`有效期至 ${rule.validUntil}`);
+	parts.push(`时区 ${rule.timezone}`);
+	return parts.join(" · ");
+}
+
+/** 某日历被哪些规则引用 */
+function referencedRuleNames(schema: PricingSchema, id: string, kind: "calendar"): string[] {
+	return schema.rules
+		.filter((r) => (kind === "calendar" ? r.includeCalendars.includes(id) || r.excludeCalendars.includes(id) : false))
+		.map((r) => r.name);
+}
+
+/** help 文本（从命令规格派生） */
+export function renderHelp(): string {
+	const lines = ["/price — 模型计费配置（v5）", "", "  /price                     列出已设定方案的模型（字母序）"];
+	for (const sub of PRICE_SUBCOMMANDS) {
+		const children = (sub.children ?? []).map((c) => `      /price ${sub.name} ${c.name.padEnd(10)} ${c.summary}`);
+		lines.push(`  /price ${sub.name.padEnd(10)} ${sub.summary}`);
+		lines.push(...children);
+	}
+	return lines.join("\n");
+}
+
+// ── 命令实现 ──────────────────────────────────────────────────────────────
+
+/** /price 命令：挂载、分发、补全、帮助 */
 export class PricingCommands {
-	private readonly drawer: PricingDrawer;
+	/** 会话内 AI 编辑模式是否启用（本地标记，配合 pi 的 active tools） */
+	private aiEnabled = false;
 
-	/** AI 辅助配置工具集（注册但不激活，/price ai 才启用） */
-	private readonly agentTools: PricingAgentTools;
+	constructor(
+		private readonly filePath?: string,
+		/** AI 工具集（批次④注入；未注入时仅切换 active tools） */
+		private readonly aiTools?: PricingAgentTools,
+	) {}
 
-	/** filePath 注入便于单测隔离（默认读 ~/.pi/model-pricing.json） */
-	private readonly filePath?: string;
-
-	constructor(filePath?: string) {
-		this.filePath = filePath;
-		this.drawer = new PricingDrawer(filePath);
-		this.agentTools = new PricingAgentTools(filePath);
+	/** 打开数据库（每次命令取最新磁盘状态与乐观锁基线） */
+	private open(): Database {
+		return Database.open(this.filePath);
 	}
 
+	/** 挂载到 pi：注册 /price 命令 */
 	mount(pi: ExtensionAPI): void {
-		seedPricing(this.filePath);
-
-		// 工具先注册（此时未激活，模型看不到也调不到；/price ai 才加入 active tools）
-		this.agentTools.register(pi);
-
 		pi.registerCommand("price", {
-			description: "模型计费（v2 五注册表）：无参开抽屉 | model|list|scheme|rate|calendar|ai|help",
-			// pi 只认这个字段生成扩展命令的参数补全（扩展无法设 argumentHint）
-			getArgumentCompletions: (prefix: string) => this.completeArguments(prefix),
-			handler: async (args: string, ctx: ExtensionCommandContext) => {
-				const parts = args.trim().split(/\s+/);
-				const sub = parts[0] ?? "";
-
-					switch (sub) {
-					case "":
-						// 无参：TUI 下开抽屉（模型面）；headless 回退文本总览
-						if (await this.drawer.open(ctx)) break;
-						ctx.ui.notify(renderPriceList(this.filePath), "info");
-						break;
-					case "list":
-						// TUI 下以 Markdown 总览只读页呈现；headless 回退纯文本
-						if (await this.drawer.open(ctx, "list")) break;
-						ctx.ui.notify(renderPriceList(this.filePath), "info");
-						break;
-					case "help":
-						// TUI 下打开帮助页（InfoPage 排版，可滚动）；headless 回退纯文本
-						if (await this.drawer.open(ctx, "help")) break;
-						ctx.ui.notify(renderHelp(), "info");
-						break;
-					case "model":
-						await this.showModel(parts[1], parts[2], ctx);
-						break;
-					case "scheme":
-						// TUI 下直达方案管理页；headless 回退文本
-						if (await this.drawer.open(ctx, "scheme")) break;
-						this.planOp(parts[1], parts[2], parts[3], ctx);
-						break;
-					case "rate":
-						// TUI 下直达价格管理页；headless 回退文本
-						if (await this.drawer.open(ctx, "rate")) break;
-						this.priceOp(parts[1], parts[2], parts[3], parts[4], ctx);
-						break;
-					case "calendar":
-						// TUI 下直达日历管理页；headless 回退文本
-						if (await this.drawer.open(ctx, "calendar")) break;
-						this.calendarOp(parts[1], parts[2], parts[3], parts.slice(4), ctx);
-						break;
-					case "ai":
-						await this.aiOp(parts[1], pi, ctx);
-						break;
-					default:
-						ctx.ui.notify(renderHelp(), "info");
-				}
-			},
+			description: "模型计费配置（rate / calendar / rule / plan / ai）",
+			getArgumentCompletions: (prefix) => this.completions(prefix),
+			handler: (args, ctx) => this.handle(args, ctx, pi),
 		});
 	}
 
-	/**
-	 * /price 的参数补全（pi 的 getArgumentCompletions 协议）。
-	 *
-	 * 分层规则：按已输入的 token 数决定补哪一层
-	 * - 第 1 个 token → 一级子命令
-	 * - 第 2 个 token → 二级动作（scheme/rate/calendar）
-	 * - 第 3+ 个 token → 动态 id（provider/model/id/field/value）
-	 *
-	 * 任何异常都吞掉并降级为静态候选：补全抛错会破坏输入框体验。
-	 */
-	private completeArguments(argumentText: string): AutocompleteItem[] | null {
-		try {
-			return this.buildCompletions(argumentText);
-		} catch {
-			// 文件损坏等异常：退化为一级子命令候选
-			return this.toItems(PRICE_SUBCOMMANDS.map((s) => ({ value: s.name, description: s.summary })), "");
-		}
-	}
-
-	/**
-	 * 补全主逻辑（异常已在上层兜底）。
-	 *
-	 * 统一模型：把输入拆成 tokens，先求出"当前正在补的位置参数下标" slot，
-	 * 再按该位置的语义（provider/model/plan/direction/id/field/value）给候选。
-	 * 「末尾有空格」= 前一 token 已完成，正在开新 token；否则正在补最后一个 token。
-	 */
-	private buildCompletions(argumentText: string): AutocompleteItem[] | null {
-		const endsWithSpace = /\s$/.test(argumentText);
-		const trimmed = argumentText.trim();
-		const tokens = trimmed === "" ? [] : trimmed.split(/\s+/);
-
-		// 已完成的位置参数（末尾无空格时，最后一个 token 是"正在补"的，不算完成）
-		const settled = endsWithSpace || trimmed === "" ? tokens : tokens.slice(0, -1);
-		// 正在补的 token 前缀（末尾有空格时为空）
-		const prefix = endsWithSpace || trimmed === "" ? "" : tokens[tokens.length - 1];
-
-		// 第 1 个位置：一级子命令
-		if (settled.length === 0) {
-			return this.toItems(PRICE_SUBCOMMANDS.map((s) => ({ value: s.name, description: s.summary })), prefix);
-		}
-
-		const spec = findSubcommand(settled[0]);
-		if (!spec) return null;
-
-// 判断是否已输入二级动作（scheme create / rate set / calendar add）
-			const action = spec.children?.find((c) => c.name === settled[1]);
-		// 位置参数语义表：有 action 用 action 的，否则用子命令自身的
-		const positionals = action ? (action.args ?? []) : (spec.args ?? []);
-		// 已消费的位置参数个数（减去子命令名，以及已输入的动作名）
-		const consumed = settled.slice(action ? 2 : 1);
-		const slotIndex = consumed.length;
-
-		// 第 2 个位置且尚未输入动作：补动作名（已输入动作时走位置语义）
-		if (!action && slotIndex === 0 && spec.children?.length) {
-			return this.toItems(spec.children.map((c) => ({ value: c.name, description: c.summary })), prefix);
-		}
-
-		// 其余：按位置语义给动态候选
-		const slot = positionals[slotIndex];
-		return this.completeDynamic(spec.name, slot, consumed, prefix);
-	}
-
-	/** 按位置参数语义给动态候选（读当前配置取真实 id） */
-	private completeDynamic(name: string, slot: string | undefined, consumed: string[], prefix: string): AutocompleteItem[] | null {
-		const schema = readPricing(this.filePath);
-		const providers = Object.keys(schema.providers);
-		const modelsOf = (p: string): string[] => Object.keys(schema.providers[p]?.models ?? {});
-
-		switch (slot) {
-			case "provider":
-				return this.toItems(
-					providers.map((p) => ({ value: p, description: `${modelsOf(p).length} 个模型` })),
-					prefix,
-				);
-			case "model": {
-				// 若 provider 已输入，只列该 provider 的模型；否则列全部
-				const pickedProvider = consumed[consumed.indexOf("provider") + 1];
-				void pickedProvider;
-				const scoped = consumed[0] && schema.providers[consumed[0]] ? modelsOf(consumed[0]) : undefined;
-				const all = providers.flatMap((p) => modelsOf(p).map((m) => ({ value: m, description: `${p}/${m}` })));
-				const items = scoped ? scoped.map((m) => ({ value: m, description: `${consumed[0]}/${m}` })) : all;
-				return this.toItems(items, prefix);
+	/** 命令入口：分发到各子命令（TUI 下无二级动作时开抽屉） */
+	private async handle(args: string, ctx: ExtensionCommandContext, pi: ExtensionAPI): Promise<void> {
+		const tokens = tokenize(args);
+		// TUI 直达：/price 或 /price <page>（不带二级动作）直接开抽屉到对应页
+		if (ctx.mode === "tui") {
+			const direct = this.drawerPageFor(tokens);
+			if (direct !== null) {
+				await openPricingDrawer(ctx, { initial: direct, filePath: this.filePath });
+				return;
 			}
-			case "field":
-				return this.toItems(PRICE_FIELDS.map((f) => ({ value: f })), prefix);
-			case "id":
-				return this.toItems(this.registryIds(name, schema), prefix);
+		}
+		if (tokens.length === 0) {
+			this.notify(ctx, renderModelList(this.open().snapshot()));
+			return;
+		}
+		const [sub, ...rest] = tokens;
+		try {
+			switch (sub) {
+				case "rate":
+					this.cmdRate(rest, ctx);
+					break;
+				case "calendar":
+					this.cmdCalendar(rest, ctx);
+					break;
+				case "rule":
+					this.cmdRule(rest, ctx);
+					break;
+				case "plan":
+					this.cmdPlan(rest, ctx);
+					break;
+				case "ai":
+					await this.cmdAi(rest, ctx, pi);
+					break;
+				default:
+					this.notify(ctx, `未知子命令：${sub}\n\n${renderHelp()}`, "warning");
+			}
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			this.notify(ctx, `操作失败：${message}`, "error");
+		}
+	}
+
+	/** 通知用户（info 默认） */
+	private notify(ctx: ExtensionCommandContext, message: string, type: "info" | "warning" | "error" = "info"): void {
+		ctx.ui.notify(message, type);
+	}
+
+	/**
+	 * 判断是否应该开抽屉：
+	 * - 无参数 → 模型列表；
+	 * - 仅有页面子命令（rate/calendar/rule/plan）→ 对应页；
+	 * - 带二级动作（如 rate add）→ 返回 null（走文本执行，便于脚本化）。
+	 */
+	private drawerPageFor(tokens: string[]): DrawerPage | null {
+		if (tokens.length === 0) return "models";
+		if (tokens.length > 1) return null;
+		switch (tokens[0]) {
+			case "rate":
+			case "calendar":
+			case "rule":
+			case "plan":
+				return tokens[0];
 			default:
-				// 无位置参数语义的子命令（list/help）不补
 				return null;
 		}
 	}
 
-	/** 按子命令取对应注册表的已有 id 候选 */
-	private registryIds(name: string, schema: PricingSchema): Array<{ value: string; description?: string }> {
-		switch (name) {
-			case "scheme":
-				return Object.entries(schema.plans).map(([id, p]) => ({ value: id, description: p.name }));
-			case "rate":
-				return Object.entries(schema.prices).map(([id, p]) => ({ value: id, description: p.name }));
-			case "calendar":
-				return Object.entries(schema.calendars).map(([id, c]) => ({ value: id, description: c.name }));
+	/** 查找价格（按 name） */
+	private findRate(schema: PricingSchema, name: string): RateDoc {
+		const rate = schema.rates.find((r) => r.name === name);
+		if (!rate) throw new Error(`价格「${name}」不存在`);
+		return rate;
+	}
+
+	/** 查找日历（按 name） */
+	private findCalendar(schema: PricingSchema, name: string): CalendarDoc {
+		const cal = schema.calendars.find((c) => c.name === name);
+		if (!cal) throw new Error(`日历「${name}」不存在`);
+		return cal;
+	}
+
+	/** 查找规则（按 name） */
+	private findRule(schema: PricingSchema, name: string): RuleDoc {
+		const rule = schema.rules.find((r) => r.name === name);
+		if (!rule) throw new Error(`规则「${name}」不存在`);
+		return rule;
+	}
+
+	/** 查找方案（按 name） */
+	private findPlan(schema: PricingSchema, name: string): PlanDoc {
+		const plan = schema.plans.find((p) => p.name === name);
+		if (!plan) throw new Error(`方案「${name}」不存在`);
+		return plan;
+	}
+
+	// ── rate ──────────────────────────────────────────────────────────────
+
+	/** /price rate <list|add|set|remove> */
+	private cmdRate(args: string[], ctx: ExtensionCommandContext): void {
+		const action = args[0] ?? "list";
+		const parsed = parseArgs(args.slice(1));
+		const db = this.open();
+		switch (action) {
+			case "list":
+				this.notify(ctx, renderRateList(db.snapshot()));
+				break;
+			case "add": {
+				const [name, miss, hit, output] = parsed.positionals;
+				if (!name || miss === undefined || hit === undefined || output === undefined) {
+					throw new Error("用法：/price rate add <name> <miss> <hit> <output>");
+				}
+				db.transaction((tx) => {
+					tx.rates.ensureUniqueName(name);
+					tx.rates.insertOne({
+						name,
+						inputMiss: Number(miss),
+						inputHit: Number(hit),
+						output: Number(output),
+					});
+				});
+				this.notify(ctx, `已新建价格「${name}」`);
+				break;
+			}
+			case "set": {
+				const [name, field, value] = parsed.positionals;
+				if (!name || !field || value === undefined) throw new Error("用法：/price rate set <name> <field> <value>");
+				if (!RATE_FIELDS.includes(field as (typeof RATE_FIELDS)[number])) {
+					throw new Error(`字段非法：${field}（可选 ${RATE_FIELDS.join(" / ")}）`);
+				}
+				db.transaction((tx) => {
+					const rate = this.findRate(tx.snapshot(), name);
+					tx.rates.updateOne(rate._id, { [field]: Number(value) } as Partial<RateDoc>);
+				});
+				this.notify(ctx, `已更新价格「${name}」的 ${field} = ${value}`);
+				break;
+			}
+			case "remove": {
+				const [name] = parsed.positionals;
+				if (!name) throw new Error("用法：/price rate remove <name>");
+				db.transaction((tx) => {
+					const schema = tx.snapshot();
+					const rate = this.findRate(schema, name);
+					const check = checkRateDeletable(schema, rate._id);
+					if (!check.ok) throw new Error(check.reason);
+					tx.rates.deleteOne(rate._id);
+				});
+				this.notify(ctx, `已删除价格「${name}」`);
+				break;
+			}
 			default:
-				return [];
+				this.notify(ctx, `未知动作：rate ${action}`, "warning");
 		}
 	}
 
-	/** 前缀过滤（忽略大小写）+ 去空值；无匹配返回 null（pi 约定） */
-	private toItems(candidates: Array<{ value: string; description?: string }>, prefix: string): AutocompleteItem[] | null {
-		const lower = prefix.toLowerCase();
-		const filtered = candidates
-			.filter((c) => c.value !== "")
-			.filter((c) => c.value.toLowerCase().startsWith(lower));
-		if (filtered.length === 0) return null;
-		return filtered.map((c) => ({
-			value: c.value,
-			label: c.value,
-			...(c.description ? { description: c.description } : {}),
-		}));
+	// ── calendar ──────────────────────────────────────────────────────────
+
+	/** /price calendar <list|add|add-dates|remove> */
+	private cmdCalendar(args: string[], ctx: ExtensionCommandContext): void {
+		const action = args[0] ?? "list";
+		const parsed = parseArgs(args.slice(1));
+		const db = this.open();
+		switch (action) {
+			case "list":
+				this.notify(ctx, renderCalendarList(db.snapshot()));
+				break;
+			case "add": {
+				const [name, dates] = parsed.positionals;
+				if (!name || dates === undefined) throw new Error('用法：/price calendar add <name> "<日期...>"');
+				db.transaction((tx) => {
+					tx.calendars.ensureUniqueName(name);
+					tx.calendars.insertOne({ name, dates: parseDates(dates) });
+				});
+				this.notify(ctx, `已新建日历「${name}」`);
+				break;
+			}
+			case "add-dates": {
+				const [name, dates] = parsed.positionals;
+				if (!name || dates === undefined) throw new Error('用法：/price calendar add-dates <name> "<日期...>"');
+				db.transaction((tx) => {
+					const cal = this.findCalendar(tx.snapshot(), name);
+					const merged = [...new Set([...cal.dates, ...parseDates(dates)])];
+					tx.calendars.updateOne(cal._id, { dates: merged });
+				});
+				this.notify(ctx, `已向日历「${name}」追加日期`);
+				break;
+			}
+			case "remove": {
+				const [name] = parsed.positionals;
+				if (!name) throw new Error("用法：/price calendar remove <name>");
+				db.transaction((tx) => {
+					const schema = tx.snapshot();
+					const cal = this.findCalendar(schema, name);
+					const check = checkCalendarDeletable(schema, cal._id);
+					if (!check.ok) throw new Error(check.reason);
+					tx.calendars.deleteOne(cal._id);
+				});
+				this.notify(ctx, `已删除日历「${name}」`);
+				break;
+			}
+			default:
+				this.notify(ctx, `未知动作：calendar ${action}`, "warning");
+		}
 	}
 
-	private async showModel(provider: string | undefined, model: string | undefined, ctx: ExtensionCommandContext): Promise<void> {
-		if (!provider || !model) {
-			ctx.ui.notify("用法: /price model <provider> <model>", "info");
-			return;
+	// ── rule ──────────────────────────────────────────────────────────────
+
+	/** /price rule <list|add|remove> */
+	private cmdRule(args: string[], ctx: ExtensionCommandContext): void {
+		const action = args[0] ?? "list";
+		const parsed = parseArgs(args.slice(1));
+		const db = this.open();
+		switch (action) {
+			case "list":
+				this.notify(ctx, renderRuleList(db.snapshot()));
+				break;
+			case "add": {
+				const [name, rateName] = parsed.positionals;
+				if (!name || !rateName) {
+					throw new Error("用法：/price rule add <name> <rateName> [--weekdays 1-5] [--ranges 09:00-12:00,...]");
+				}
+				const weekdaysExpr = flagValue(parsed.flags, "weekdays");
+				const rangesExpr = flagValue(parsed.flags, "ranges");
+				const includeCal = flagList(parsed.flags, "include-cal");
+				const excludeCal = flagList(parsed.flags, "exclude-cal");
+				const includeDates = flagList(parsed.flags, "include-dates");
+				const excludeDates = flagList(parsed.flags, "exclude-dates");
+				const validUntil = flagValue(parsed.flags, "valid-until");
+				const timezone = flagValue(parsed.flags, "timezone") ?? "Asia/Shanghai";
+				db.transaction((tx) => {
+					const schema = tx.snapshot();
+					const rate = this.findRate(schema, rateName);
+					tx.rules.ensureUniqueName(name);
+					tx.rules.insertOne({
+						name,
+						rateId: rate._id,
+						timezone,
+						weekdays: weekdaysExpr ? parseWeekdays(weekdaysExpr) : [],
+						ranges: rangesExpr ? parseRanges(rangesExpr) : [],
+						includeCalendars: includeCal.map((n) => this.findCalendar(schema, n)._id),
+						excludeCalendars: excludeCal.map((n) => this.findCalendar(schema, n)._id),
+						includeDates,
+						excludeDates,
+						...(validUntil ? { validUntil } : {}),
+					});
+				});
+				this.notify(ctx, `已新建规则「${name}」`);
+				break;
+			}
+			case "remove": {
+				const [name] = parsed.positionals;
+				if (!name) throw new Error("用法：/price rule remove <name>");
+				db.transaction((tx) => {
+					const schema = tx.snapshot();
+					const rule = this.findRule(schema, name);
+					const check = checkRuleDeletable(schema, rule._id);
+					if (!check.ok) throw new Error(check.reason);
+					tx.rules.deleteOne(rule._id);
+				});
+				this.notify(ctx, `已删除规则「${name}」`);
+				break;
+			}
+			default:
+				this.notify(ctx, `未知动作：rule ${action}`, "warning");
 		}
-		// TUI 下以 Markdown 详情只读页呈现（InfoPage）；headless 回退纯文本
-		if (await this.drawer.open(ctx, "model", { provider, model })) return;
-		ctx.ui.notify(renderModelDetail(provider, model, this.filePath), "info");
 	}
+
+	// ── plan ──────────────────────────────────────────────────────────────
+
+	/** /price plan <list|add|set-alias|add-rule|remove-rule|enable|disable|bind|remove> */
+	private cmdPlan(args: string[], ctx: ExtensionCommandContext): void {
+		const action = args[0] ?? "list";
+		const parsed = parseArgs(args.slice(1));
+		const db = this.open();
+		switch (action) {
+			case "list":
+				this.notify(ctx, renderPlanList(db.snapshot()));
+				break;
+			case "add": {
+				const [name, alias] = parsed.positionals;
+				if (!name) throw new Error('用法：/price plan add <name> ["<alias>"]');
+				const cleanAlias = alias?.trim() ?? "";
+				db.transaction((tx) => {
+					tx.plans.ensureUniqueName(name);
+					tx.plans.insertOne({ name, enabled: true, ruleIds: [], ...(cleanAlias ? { alias: cleanAlias } : {}) });
+				});
+				this.notify(ctx, `已新建方案「${name}」（尚未纳入规则，请用 add-rule 添加）`);
+				break;
+			}
+			case "set-alias": {
+				const [name, alias] = parsed.positionals;
+				if (!name || alias === undefined) throw new Error('用法：/price plan set-alias <name> "<alias>"');
+				db.transaction((tx) => {
+					const plan = this.findPlan(tx.snapshot(), name);
+					tx.plans.updateOne(plan._id, { alias: alias.trim() === "" ? undefined : alias.trim() });
+				});
+				this.notify(ctx, `已更新方案「${name}」别名`);
+				break;
+			}
+			case "add-rule": {
+				const [planName, ruleName] = parsed.positionals;
+				if (!planName || !ruleName) throw new Error("用法：/price plan add-rule <planName> <ruleName>");
+				db.transaction((tx) => {
+					const schema = tx.snapshot();
+					const plan = this.findPlan(schema, planName);
+					const rule = this.findRule(schema, ruleName);
+					if (!plan.ruleIds.includes(rule._id)) {
+						tx.plans.updateOne(plan._id, { ruleIds: [...plan.ruleIds, rule._id] });
+					}
+				});
+				this.notify(ctx, `已把规则「${ruleName}」纳入方案「${planName}」`);
+				break;
+			}
+			case "remove-rule": {
+				const [planName, ruleName] = parsed.positionals;
+				if (!planName || !ruleName) throw new Error("用法：/price plan remove-rule <planName> <ruleName>");
+				db.transaction((tx) => {
+					const schema = tx.snapshot();
+					const plan = this.findPlan(schema, planName);
+					const rule = this.findRule(schema, ruleName);
+					tx.plans.updateOne(plan._id, { ruleIds: plan.ruleIds.filter((id) => id !== rule._id) });
+				});
+				this.notify(ctx, `已把规则「${ruleName}」移出方案「${planName}」`);
+				break;
+			}
+			case "enable":
+			case "disable": {
+				const [name] = parsed.positionals;
+				if (!name) throw new Error(`用法：/price plan ${action} <name>`);
+				const enabled = action === "enable";
+				db.transaction((tx) => {
+					const plan = this.findPlan(tx.snapshot(), name);
+					tx.plans.updateOne(plan._id, { enabled });
+				});
+				this.notify(ctx, `已${enabled ? "启用" : "禁用"}方案「${name}」`);
+				break;
+			}
+			case "bind": {
+				const [provider, model, planName] = parsed.positionals;
+				if (!provider || !model || !planName) throw new Error("用法：/price plan bind <provider> <model> <planName>");
+				db.transaction((tx) => {
+					const plan = this.findPlan(tx.snapshot(), planName);
+					const existing = tx.models.findOne((m) => m.provider === provider && m.model === model);
+					if (existing) tx.models.updateOne(existing._id, { planId: plan._id });
+					else tx.models.insertOne({ provider, model, planId: plan._id });
+				});
+				this.notify(ctx, `已绑定 ${provider}/${model} → 方案「${planName}」`);
+				break;
+			}
+			case "remove": {
+				const [name] = parsed.positionals;
+				if (!name) throw new Error("用法：/price plan remove <name>");
+				db.transaction((tx) => {
+					const schema = tx.snapshot();
+					const plan = this.findPlan(schema, name);
+					const check = checkPlanDeletable(schema, plan._id);
+					if (!check.ok) throw new Error(check.reason);
+					tx.plans.deleteOne(plan._id);
+				});
+				this.notify(ctx, `已删除方案「${name}」`);
+				break;
+			}
+			default:
+				this.notify(ctx, `未知动作：plan ${action}`, "warning");
+		}
+	}
+
+	// ── ai ────────────────────────────────────────────────────────────────
+
+	/** /price ai [on|off]：会话级启用 / 停用 AI 编辑模式 */
+	private async cmdAi(args: string[], ctx: ExtensionCommandContext, pi: ExtensionAPI): Promise<void> {
+		const action = args[0] ?? "on";
+		const active = new Set(pi.getActiveTools());
+		switch (action) {
+			case "on": {
+				if (!ctx.hasUI) {
+					this.notify(ctx, "当前模式不支持交互确认，无法启用 AI 编辑模式。", "warning");
+					return;
+				}
+				const ok = await ctx.ui.confirm("启用 AI 编辑模式？", "启用后，本次会话内 agent 可读取并修改计费配置（落盘前会再次确认）。");
+				if (!ok) {
+					this.notify(ctx, "已取消，未启用 AI 编辑模式。", "warning");
+					return;
+				}
+				this.aiEnabled = true;
+				this.aiTools?.setEnabled(true);
+				pi.setActiveTools([...active, ...PRICE_AI_TOOL_NAMES]);
+				this.notify(ctx, "已启用 AI 编辑模式：agent 现可调用 price_get / price_apply / price_review / price_save / price_discard。");
+				break;
+			}
+			case "off": {
+				this.aiEnabled = false;
+				this.aiTools?.setEnabled(false);
+				pi.setActiveTools([...active].filter((name) => !PRICE_AI_TOOL_NAMES.includes(name as (typeof PRICE_AI_TOOL_NAMES)[number])));
+				this.notify(ctx, "已停用 AI 编辑模式。");
+				break;
+			}
+			default:
+				this.notify(ctx, `未知动作：ai ${action}（可选 on / off）`, "warning");
+		}
+	}
+
+	/** AI 编辑模式是否启用（供工具层判断） */
+	get isAiEnabled(): boolean {
+		return this.aiEnabled;
+	}
+
+	// ── 补全 ──────────────────────────────────────────────────────────────
 
 	/**
-	 * /price ai [on|off]：显式启用/停用 AI 编辑模式（会话级）。
-	 *
-	 * 启用 = 把 price_* 加入 active tools（未启用时模型看不到也调不到）；
-	 * 停用 = 从 active tools 移除并清空服务实例。
+	 * 命令补全：按 token 位置与语义给候选。
+	 * 无参时列一级子命令；有空格后按位置给二级动作或动态 name。
 	 */
-	private async aiOp(action: string | undefined, pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
-		switch (action) {
-			case "off":
-				this.disableAgent(pi, ctx);
-				break;
-			case "on":
-			case undefined:
-				await this.enableAgent(pi, ctx);
-				break;
-			default:
-				ctx.ui.notify("用法: /price ai [on|off]", "info");
-		}
-	}
-
-	/** 启用 AI 编辑模式：先征得用户同意，再激活工具 */
-	private async enableAgent(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
-		if (!ctx.hasUI) {
-			ctx.ui.notify("AI 编辑模式需要交互式界面（TUI），当前环境不支持。", "warning");
-			return;
-		}
-		if (this.agentTools.enabled) {
-			ctx.ui.notify("AI 编辑模式已启用。让 agent 读取价格文档并帮你修改即可；/price ai off 可停用。", "info");
-			return;
-		}
-		const ok = await ctx.ui.confirm(
-			"启用 AI 编辑模式",
-			`本次会话内允许 agent 修改计费配置（${this.filePath ?? "~/.pi/model-pricing.json"}）。\n\n所有改动先进内存草稿，首次落盘前会再次向你确认。`,
-		);
-		if (!ok) {
-			ctx.ui.notify("已取消，未启用 AI 编辑模式。", "info");
-			return;
-		}
-		this.agentTools.enable();
-		pi.setActiveTools([...new Set([...pi.getActiveTools(), ...PRICING_AGENT_TOOL_NAMES])]);
-		ctx.ui.notify("AI 编辑模式已启用。现在可以让 agent 读取价格文档并修改配置。", "info");
-	}
-
-	/** 停用 AI 编辑模式：移除工具并清空服务实例 */
-	private disableAgent(pi: ExtensionAPI, ctx: ExtensionCommandContext): void {
-		if (!this.agentTools.enabled) {
-			ctx.ui.notify("AI 编辑模式未启用。", "info");
-			return;
-		}
-		this.agentTools.disable();
-		const remove = new Set<string>(PRICING_AGENT_TOOL_NAMES);
-		pi.setActiveTools(pi.getActiveTools().filter((name) => !remove.has(name)));
-		ctx.ui.notify("AI 编辑模式已停用（未保存的草稿已丢弃）。", "info");
-	}
-
-	/** /price scheme [<id>] | scheme create <id> <name> | scheme duplicate <id> | scheme delete <id> */
-	private planOp(op: string | undefined, id: string | undefined, name: string | undefined, ctx: ExtensionCommandContext): void {
-		switch (op) {
-			case "create":
-				this.createPlan(id, name, ctx);
-				break;
-			case "duplicate":
-				this.duplicatePlan(id, ctx);
-				break;
-			case "delete":
-				this.deletePlan(id, ctx);
-				break;
-			case undefined:
-				ctx.ui.notify(renderPlanList(this.filePath), "info");
-				break;
-			default:
-				ctx.ui.notify(renderPlanDetail(op, this.filePath), "info");
-		}
-	}
-
-	/** 新建方案：空方案无规则会导致校验失败，故默认挂上第一个价格实体作为 always 规则 */
-	private createPlan(planId: string | undefined, name: string | undefined, ctx: ExtensionCommandContext): void {
-		if (!planId) {
-			ctx.ui.notify("用法: /price scheme create <plan-id> [name]", "info");
-			return;
-		}
+	completions(argumentPrefix: string): CompletionItem[] {
+		const tokens = tokenize(argumentPrefix);
+		const endsWithSpace = /\s$/.test(argumentPrefix);
+		const current = endsWithSpace ? "" : tokens.pop() ?? "";
 		try {
-			let created = false;
-			updatePricing((data) => {
-				if (data.plans[planId]) throw new Error(`方案已存在: ${planId}`);
-				const firstPrice = Object.keys(data.prices)[0];
-				if (!firstPrice) throw new Error("价格注册表为空，请先 /price rate create");
-				data.plans[planId] = {
-					name: name ?? planId,
-					rules: [{ schedule: { timezone: "Asia/Shanghai", weekdays: [], ranges: [] }, price: firstPrice }],
-				};
-				created = true;
-				return data;
-			}, this.filePath);
-			if (created) ctx.ui.notify(`已新建方案 ${planId}（默认挂价格 ${Object.keys(readPricing(this.filePath).prices)[0]}，请 /price bind 绑定）`, "info");
-		} catch (err) {
-			ctx.ui.notify(`新建失败: ${(err as Error).message}`, "info");
+			switch (tokens.length) {
+				case 0:
+					return filterSubcommands(current);
+				case 1:
+					return filterChildren(tokens[0], current);
+				default:
+					return this.dynamicCompletions(tokens, current);
+			}
+		} catch {
+			// 补全不得抛错（会破坏输入体验）：异常时降级为空
+			return [];
 		}
 	}
 
-	/** 复制方案：新 id 自动去重（<id>-copy / <id>-copy2 ...） */
-	private duplicatePlan(planId: string | undefined, ctx: ExtensionCommandContext): void {
-		if (!planId) {
-			ctx.ui.notify("用法: /price scheme duplicate <plan-id>", "info");
-			return;
+	/** 第三层及以后：按子命令与动作给动态 name 候选 */
+	private dynamicCompletions(tokens: string[], current: string): CompletionItem[] {
+		const [sub, action] = tokens;
+		const schema = this.open().snapshot();
+		const position = tokens.length - 2; // 已填的位置参数个数（不含当前输入）
+		const names = (items: Array<{ name: string }>): CompletionItem[] =>
+			items
+				.filter((item) => item.name.startsWith(current))
+				.map((item) => ({ value: quoteIfNeeded(item.name), label: item.name }));
+		if (sub === "rate") {
+			if (action === "set") return position === 0 ? names(schema.rates) : fieldCompletions(current);
+			if (action === "remove") return names(schema.rates);
+			return [];
 		}
-		let newId = "";
-		try {
-			updatePricing((data) => {
-				const src = data.plans[planId!];
-				if (!src) throw new Error(`未找到方案: ${planId}`);
-				newId = `${planId}-copy`;
-				let n = 2;
-				while (data.plans[newId]) {
-					newId = `${planId}-copy${n}`;
-					n += 1;
-				}
-				data.plans[newId] = { name: `${src.name}（副本）`, rules: JSON.parse(JSON.stringify(src.rules)) };
-				return data;
-			}, this.filePath);
-		} catch (err) {
-			ctx.ui.notify(`复制失败: ${(err as Error).message}`, "info");
-			return;
+		if (sub === "calendar") return action === "add" ? [] : names(schema.calendars);
+		if (sub === "rule") return action === "add" ? (position === 1 ? names(schema.rates) : []) : names(schema.rules);
+		if (sub === "plan") {
+			if (action === "bind") {
+				if (position === 0 || position === 1) return [];
+				return names(schema.plans);
+			}
+			return position === 0 ? names(schema.plans) : names(schema.rules);
 		}
-		ctx.ui.notify(`已复制为 ${newId}`, "info");
+		return [];
 	}
+}
 
-	/** 删除方案（引用于被绑定时拒绝） */
-	private deletePlan(planId: string | undefined, ctx: ExtensionCommandContext): void {
-		if (!planId) {
-			ctx.ui.notify("用法: /price scheme delete <plan-id>", "info");
-			return;
-		}
-		try {
-			updatePricing((data) => {
-				const guard = checkPlanDeletable(data, planId!);
-				if (!guard.ok) throw new Error(guard.reason);
-				delete data.plans[planId!];
-				return data;
-			}, this.filePath);
-		} catch (err) {
-			ctx.ui.notify(`删除失败: ${(err as Error).message}`, "info");
-			return;
-		}
-		ctx.ui.notify(`已删除方案 ${planId}`, "info");
-	}
+/** 一级子命令候选（前缀过滤） */
+function filterSubcommands(prefix: string): CompletionItem[] {
+	return PRICE_SUBCOMMANDS.filter((sub) => sub.name.startsWith(prefix)).map((sub) => ({
+		value: sub.name,
+		label: sub.name,
+		description: sub.summary,
+	}));
+}
 
-	/** /price calendar [add <id> <name> <dates...>] [remove <id>] */
-	private calendarOp(op: string | undefined, id: string | undefined, name: string | undefined, dates: string[], ctx: ExtensionCommandContext): void {
-		switch (op) {
-			case "add":
-				this.addCalendar(id, name, dates, ctx);
-				break;
-			case "remove":
-				this.removeCalendar(id, ctx);
-				break;
-			case undefined:
-				ctx.ui.notify(renderCalendarList(this.filePath), "info");
-				break;
-			default:
-				ctx.ui.notify(`未知子命令: ${op}\n用法: /price calendar [add <id> <name> <dates> | remove <id>]`, "info");
-		}
-	}
+/** 二级动作候选 */
+function filterChildren(subName: string, prefix: string): CompletionItem[] {
+	const sub = findSubcommand(subName);
+	if (!sub?.children) return [];
+	return sub.children
+		.filter((child) => child.name.startsWith(prefix))
+		.map((child) => ({ value: child.name, label: child.name, description: child.summary }));
+}
 
-	/** 新建/覆盖日历；日期支持 "YYYY-MM-DD"（单年）与 "MM-DD"（每年循环） */
-	private addCalendar(calId: string | undefined, name: string | undefined, dates: string[], ctx: ExtensionCommandContext): void {
-		if (!calId || !name || dates.length === 0) {
-			ctx.ui.notify("用法: /price calendar add <id> <name> <dates...>\n  例: /price calendar add cn-holiday 法定节假日 01-01 10-01", "info");
-			return;
-		}
-		const bad = dates.find((d) => !isValidCalendarDate(d));
-		if (bad) {
-			ctx.ui.notify(`无效日期: ${bad}（需 YYYY-MM-DD 或 MM-DD，且月份 01-12、日期合法）`, "info");
-			return;
-		}
-		try {
-			updatePricing((data) => {
-				data.calendars[calId!] = { name: name!, dates };
-				return data;
-			}, this.filePath);
-		} catch (err) {
-			ctx.ui.notify(`创建失败: ${(err as Error).message}`, "info");
-			return;
-		}
-		ctx.ui.notify(`已写入日历 ${calId}（${dates.length} 天）`, "info");
-	}
-
-	/** 删除日历（被规则引用时拒绝） */
-	private removeCalendar(calId: string | undefined, ctx: ExtensionCommandContext): void {
-		if (!calId) {
-			ctx.ui.notify("用法: /price calendar remove <id>", "info");
-			return;
-		}
-		try {
-			updatePricing((data) => {
-				if (!data.calendars[calId]) throw new Error(`未找到日历: ${calId}`);
-				for (const [planId, plan] of Object.entries(data.plans)) {
-					if (plan.rules.some((r) => r.schedule.calendar === calId)) throw new Error(`日历 "${calId}" 仍被方案 "${planId}" 引用`);
-				}
-				delete data.calendars[calId!];
-				return data;
-			}, this.filePath);
-		} catch (err) {
-			ctx.ui.notify(`删除失败: ${(err as Error).message}`, "info");
-			return;
-		}
-		ctx.ui.notify(`已删除日历 ${calId}`, "info");
-	}
-
-	private priceOp(op: string | undefined, id: string | undefined, field: string | undefined, value: string | undefined, ctx: ExtensionCommandContext): void {
-		switch (op) {
-			case "set":
-				this.setPrice(id, field, value, ctx);
-				break;
-			case "create":
-				this.createPrice(id, field, ctx);
-				break;
-			case "delete":
-				this.deletePrice(id, ctx);
-				break;
-			default:
-				ctx.ui.notify(renderPriceRegistry(this.filePath), "info");
-				break;
-		}
-	}
-
-	/** 新建价格实体：/price rate create <id> <name>（初始价 0，用 rate set 补） */
-	private createPrice(priceId: string | undefined, name: string | undefined, ctx: ExtensionCommandContext): void {
-		if (!priceId) {
-			ctx.ui.notify("用法: /price rate create <price-id> [name]\n  建后可用 /price rate set 修改数值", "info");
-			return;
-		}
-		try {
-			updatePricing((data) => {
-				if (data.prices[priceId!]) throw new Error(`价格实体已存在: ${priceId}`);
-				data.prices[priceId!] = { name: name ?? priceId!, input: { miss: 0, hit: 0 }, output: 0 };
-				return data;
-			}, this.filePath);
-		} catch (err) {
-			ctx.ui.notify(`创建失败: ${(err as Error).message}`, "info");
-			return;
-		}
-		ctx.ui.notify(`已新建价格 ${priceId}（初值 0，可 /price rate set ${priceId} output <value>）`, "info");
-	}
-
-	private setPrice(priceId: string | undefined, field: string | undefined, value: string | undefined, ctx: ExtensionCommandContext): void {
-		if (!priceId || !field || !value) {
-			ctx.ui.notify("用法: /price rate set <price-id> <input.miss|input.hit|output> <value>\n  例: /price rate set deepseek-peak input.miss 2", "info");
-			return;
-		}
-		const f = parsePriceField(field);
-		if (!f) {
-			ctx.ui.notify(`无效字段: ${field}（可用 input.miss / input.hit / output）`, "info");
-			return;
-		}
-		const v = parsePriceValue(value);
-		if (v === null) {
-			ctx.ui.notify(`无效价格: ${value}（非负数字，如 4、4.5、¥0.02）`, "info");
-			return;
-		}
-		try {
-			updatePricing((data) => {
-				const p = data.prices[priceId!];
-				if (!p) throw new Error(`未找到价格实体: ${priceId}`);
-				setPriceField(p, f, v);
-				return data;
-			}, this.filePath);
-		} catch (err) {
-			ctx.ui.notify(`修改失败: ${(err as Error).message}`, "info");
-			return;
-		}
-		ctx.ui.notify(`已修改价格 ${priceId} ${f} = ${v}（/price rate 查看）`, "info");
-	}
-
-	private deletePrice(priceId: string | undefined, ctx: ExtensionCommandContext): void {
-		if (!priceId) {
-			ctx.ui.notify("用法: /price rate delete <price-id>", "info");
-			return;
-		}
-		try {
-			updatePricing((data) => {
-				const guard = checkPriceDeletable(data, priceId!);
-				if (!guard.ok) throw new Error(guard.reason);
-				delete data.prices[priceId!];
-				return data;
-			}, this.filePath);
-		} catch (err) {
-			ctx.ui.notify(`删除失败: ${(err as Error).message}`, "info");
-			return;
-		}
-		ctx.ui.notify(`已删除价格实体 ${priceId}`, "info");
-	}
+/** rate set 的字段候选 */
+function fieldCompletions(prefix: string): CompletionItem[] {
+	return RATE_FIELDS.filter((field) => field.startsWith(prefix)).map((field) => ({ value: field, label: field }));
 }

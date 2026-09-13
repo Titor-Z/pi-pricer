@@ -1,7 +1,7 @@
 {
 	"name": "@foolsecret/pi-pricer",
-	"version": "0.12.0",
-	"description": "Pi 模型计费配置中心 — 共享价格数据 + 可编辑 UI | Shared model pricing config for Pi extensions",
+	"version": "0.14.0",
+	"description": "Pi 模型计费配置中心 — 规则制定与存储 + 事务化 DAO + 6 命令面 | Model pricing config for Pi extensions",
 	"keywords": [
 		"pi-package",
 		"pi-extension"
@@ -24,7 +24,8 @@
 		".": "./extensions/index.ts",
 		"./pricing": "./src/pricing-query.ts",
 		"./store": "./src/pricing-store.ts",
-		"./types": "./src/pricing-types.ts"
+		"./types": "./src/pricing-types.ts",
+		"./db": "./src/db/database.ts"
 	},
 	"pi": {
 		"extensions": [

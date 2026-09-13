@@ -54,7 +54,13 @@ export const PricingActionSchema = Type.Union([
 		rateName: Type.String({ description: "引用的价格 name" }),
 		timezone: Type.Optional(Type.String({ description: "IANA 时区，默认 Asia/Shanghai" })),
 		weekdays: Type.Optional(Type.Array(Type.Number({ minimum: 1, maximum: 7 }), { description: "1=周一…7=周日；空=任意" })),
-		ranges: Type.Optional(Type.Array(Type.Tuple([Type.String(), Type.String()]), { description: '["HH:MM","HH:MM") 半开区间；空=全天' })),
+		// 不用 Type.Tuple：JSON Schema 元组写法（items 为数组）会被 GLM 等 OpenAI 兼容端点拒绝（400/1210）
+		ranges: Type.Optional(
+			Type.Array(
+				Type.Unsafe<[string, string]>({ type: "array", items: { type: "string" }, minItems: 2, maxItems: 2 }),
+				{ description: '["HH:MM","HH:MM") 半开区间；空=全天' },
+			),
+		),
 		includeCalendars: Type.Optional(Type.Array(Type.String({ description: "日历 name" }))),
 		excludeCalendars: Type.Optional(Type.Array(Type.String({ description: "日历 name" }))),
 		includeDates: Type.Optional(Type.Array(Type.String())),

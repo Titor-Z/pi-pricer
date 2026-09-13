@@ -1,6 +1,6 @@
 {
 	"name": "@foolsecret/pi-pricer",
-	"version": "0.15.0",
+	"version": "0.15.1",
 	"description": "Pi 模型计费配置中心 — 统一的模型价格与规则引擎 | Model pricing config & rules engine for Pi extensions",
 	"keywords": [
 		"pi-package",

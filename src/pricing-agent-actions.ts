@@ -70,13 +70,13 @@ export const PricingActionSchema = Type.Union([
 		kind: Type.Literal("upsertPlan"),
 		name: Type.String({ description: "方案显示名（全表唯一）" }),
 		alias: Type.Optional(Type.String({ description: "HUD 短名；可省略" })),
-		enabled: Type.Optional(Type.Boolean()),
 		ruleNames: Type.Optional(Type.Array(Type.String({ description: "规则 name" }))),
 	}),
-	// 单独切换方案启停
+	// 切换某模型的启用/禁用（模型级，不影响同方案其它模型）
 	Type.Object({
-		kind: Type.Literal("setPlanEnabled"),
-		name: Type.String(),
+		kind: Type.Literal("setModelEnabled"),
+		provider: Type.String(),
+		model: Type.String(),
 		enabled: Type.Boolean(),
 	}),
 	Type.Object({
@@ -111,7 +111,7 @@ export const PRICING_ACTION_KINDS = [
 	"upsertRule",
 	"deleteRule",
 	"upsertPlan",
-	"setPlanEnabled",
+	"setModelEnabled",
 	"deletePlan",
 	"bindModel",
 	"unbindModel",

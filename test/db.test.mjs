@@ -196,7 +196,7 @@ test("Database：事务提交落盘、内存态一致、explainPlan 跨表 join"
 	const dir = tmpDir();
 	const p = join(dir, "m.json");
 	const db = Database.open(p);
-	const plan = db.plans.findOne((x) => x.name === "deepseek-flash 方案");
+	const plan = db.plans.findOne((x) => x.name === "deepseek-v4-flash 方案");
 
 	const newRuleId = db.transaction((tx) => {
 		const rate = tx.rates.insertOne({ name: "促销价", inputMiss: 0.5, inputHit: 0.01, output: 2 });

@@ -154,7 +154,7 @@ export function renderModelList(schema: PricingSchema): string {
 	const width = Math.max(...ordered.map((m) => `${m.provider}/${m.model}`.length));
 	for (const model of ordered) {
 		const plan = schema.plans.find((p) => p._id === model.planId);
-		const state = plan?.enabled ? "启用" : plan ? "已禁用" : "方案缺失";
+		const state = !plan ? "方案缺失" : model.enabled === false ? "已禁用" : "启用";
 		const alias = plan?.alias ? `（${plan.alias}）` : "";
 		const label = `${model.provider}/${model.model}`;
 		lines.push(`  ${pad(label, width)}  → ${plan?.name ?? model.planId}${alias}  [${state}]`);
@@ -206,9 +206,8 @@ export function renderPlanList(schema: PricingSchema): string {
 	const lines = ["方案表", ""];
 	for (const plan of schema.plans) {
 		const models = schema.models.filter((m) => m.planId === plan._id).map((m) => `${m.provider}/${m.model}`);
-		const state = plan.enabled ? "启用" : "已禁用";
 		const alias = plan.alias ? `（${plan.alias}）` : "";
-		lines.push(`  ${plan.name}${alias}  [${state}]  ${plan.ruleIds.length} 条规则`);
+		lines.push(`  ${plan.name}${alias}  ${plan.ruleIds.length} 条规则`);
 		if (models.length > 0) lines.push(`    ← ${models.join("、")}`);
 	}
 	return lines.join("\n");
@@ -561,7 +560,7 @@ export class PricingCommands {
 				const cleanAlias = alias?.trim() ?? "";
 				db.transaction((tx) => {
 					tx.plans.ensureUniqueName(name);
-					tx.plans.insertOne({ name, enabled: true, ruleIds: [], ...(cleanAlias ? { alias: cleanAlias } : {}) });
+					tx.plans.insertOne({ name, ruleIds: [], ...(cleanAlias ? { alias: cleanAlias } : {}) });
 				});
 				this.notify(ctx, `已新建方案「${name}」（尚未纳入规则，请用 add-rule 添加）`);
 				break;
@@ -602,16 +601,17 @@ export class PricingCommands {
 				this.notify(ctx, `已把规则「${ruleName}」移出方案「${planName}」`);
 				break;
 			}
-			case "enable":
-			case "disable": {
-				const [name] = parsed.positionals;
-				if (!name) throw new Error(`用法：/price plan ${action} <name>`);
-				const enabled = action === "enable";
+			case "enable-model":
+			case "disable-model": {
+				const [provider, model] = parsed.positionals;
+				if (!provider || !model) throw new Error(`用法：/price plan ${action} <provider> <model>`);
+				const enabled = action === "enable-model";
 				db.transaction((tx) => {
-					const plan = this.findPlan(tx.snapshot(), name);
-					tx.plans.updateOne(plan._id, { enabled });
+					const doc = tx.models.findOne((m) => m.provider === provider && m.model === model);
+					if (!doc) throw new Error(`模型 ${provider}/${model} 未绑定任何方案`);
+					tx.models.updateOne(doc._id, { enabled });
 				});
-				this.notify(ctx, `已${enabled ? "启用" : "禁用"}方案「${name}」`);
+				this.notify(ctx, `已${enabled ? "启用" : "禁用"}模型 ${provider}/${model}`);
 				break;
 			}
 			case "bind": {
@@ -621,7 +621,7 @@ export class PricingCommands {
 					const plan = this.findPlan(tx.snapshot(), planName);
 					const existing = tx.models.findOne((m) => m.provider === provider && m.model === model);
 					if (existing) tx.models.updateOne(existing._id, { planId: plan._id });
-					else tx.models.insertOne({ provider, model, planId: plan._id });
+					else tx.models.insertOne({ provider, model, planId: plan._id, enabled: true });
 				});
 				this.notify(ctx, `已绑定 ${provider}/${model} → 方案「${planName}」`);
 				break;
@@ -663,7 +663,9 @@ export class PricingCommands {
 				}
 				this.aiEnabled = true;
 				this.aiTools?.setEnabled(true);
-				pi.setActiveTools([...active, ...PRICE_AI_TOOL_NAMES]);
+				// 去重：active 可能已含这些工具（重复启用 / 会话恢复了 active 集）——
+				// 同名工具入列两份会让 provider 报 "Tool names must be unique"
+				pi.setActiveTools([...new Set([...active, ...PRICE_AI_TOOL_NAMES])]);
 				this.notify(ctx, "已启用 AI 编辑模式：agent 现可调用 price_get / price_apply / price_review / price_save / price_discard。");
 				break;
 			}

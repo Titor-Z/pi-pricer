@@ -252,13 +252,13 @@ export class PricingDrawer implements Component {
 
 	// ── 根页：模型列表 ────────────────────────────────────────────────────
 
-	/** 模型绑定状态的中文描述（只看方案的启停） */
+	/** 模型绑定状态的中文描述（模型级启停） */
 	private modelState(provider: string, model: string): string {
 		const doc = this.session.schema.models.find((m) => m.provider === provider && m.model === model);
 		if (!doc) return "未绑定";
 		const plan = this.session.schema.plans.find((p) => p._id === doc.planId);
 		if (!plan) return "方案缺失";
-		return plan.enabled ? "启用" : "已禁用";
+		return doc.enabled === false ? "已禁用" : "启用";
 	}
 
 	/** 绑定状态对应的语义色（启用绿 / 禁用黄 / 缺失红） */
@@ -376,10 +376,10 @@ export class PricingDrawer implements Component {
 			() => [
 				...this.session.schema.plans.map((plan) => ({
 					id: `plan:${plan._id}`,
-					label: () => `${plan.enabled ? "◉" : "◌"} ${plan.name}${plan.alias ? `（${plan.alias}）` : ""}`,
+					label: () => `${plan.name}${plan.alias ? `（${plan.alias}）` : ""}`,
 					detail: () => `${plan.ruleIds.length} 条规则`,
 					run: () => {
-						this.session.tx.models.insertOne({ provider: ref.provider, model: ref.id, planId: plan._id });
+						this.session.tx.models.insertOne({ provider: ref.provider, model: ref.id, planId: plan._id, enabled: true });
 						this.lastMessage = `已为 ${ref.provider}/${ref.id} 绑定方案「${plan.name}」`;
 						this.pop(); // 回搜索结果
 						this.pop(); // 回根页
@@ -404,8 +404,8 @@ export class PricingDrawer implements Component {
 			placeholder: "如：2026.8 价格方案",
 			validate: (value) => this.validateNewName("plans", value),
 			onSubmit: (name) => {
-				const plan = this.session.tx.plans.insertOne({ name: name.trim(), enabled: true, ruleIds: [] });
-				this.session.tx.models.insertOne({ provider: ref.provider, model: ref.id, planId: plan._id });
+				const plan = this.session.tx.plans.insertOne({ name: name.trim(), ruleIds: [] });
+				this.session.tx.models.insertOne({ provider: ref.provider, model: ref.id, planId: plan._id, enabled: true });
 				this.lastMessage = `已新建方案「${name.trim()}」并绑定`;
 				this.pop(); // 回搜索结果
 				this.pop(); // 回根页
@@ -435,11 +435,11 @@ export class PricingDrawer implements Component {
 			},
 			{
 				id: "detail:toggle",
-				label: () => (currentPlan()?.enabled ? "禁用该方案" : "启用该方案"),
-				detail: () => `当前：${this.modelState(provider, model)}`,
+				label: () => (findModel()?.enabled === false ? "启用该模型" : "禁用该模型"),
+				detail: () => `当前：${this.modelState(provider, model)}｜仅对当前模型生效`,
 				run: () => {
-					const plan = currentPlan();
-					if (plan) this.session.tx.plans.updateOne(plan._id, { enabled: !plan.enabled });
+					const doc = findModel();
+					if (doc) this.session.tx.models.updateOne(doc._id, { enabled: doc.enabled === false });
 				},
 			},
 			{
@@ -480,8 +480,8 @@ export class PricingDrawer implements Component {
 	private buildPlanChooserPage(provider: string, model: string): Page {
 		const entries = this.session.schema.plans.map((plan) => ({
 			id: `plan:${plan._id}`,
-			label: () => `${plan.enabled ? "◉" : "◌"} ${plan.name}${plan.alias ? `（${plan.alias}）` : ""}`,
-			detail: () => `${plan.ruleIds.length} 条规则${plan.enabled ? "" : "｜方案已禁用"}`,
+			label: () => `${plan.name}${plan.alias ? `（${plan.alias}）` : ""}`,
+			detail: () => `${plan.ruleIds.length} 条规则`,
 			run: () => {
 				const doc = this.session.schema.models.find((m) => m.provider === provider && m.model === model);
 				if (doc) this.session.tx.models.updateOne(doc._id, { planId: plan._id });
@@ -1190,7 +1190,7 @@ export class PricingDrawer implements Component {
 						{
 							align: true,
 							spans: () => [
-								{ text: () => `${plan.enabled ? "◉" : "◌"} ${plan.name}` },
+								{ text: () => plan.name },
 								...(plan.alias ? [{ text: () => `@${plan.alias}`, color: "dim" }] : []),
 							],
 						},
@@ -1199,11 +1199,6 @@ export class PricingDrawer implements Component {
 							spans: () => [
 								{ text: () => `${plan.ruleIds.length} 条规则` },
 								{ text: () => `｜${this.planModelsLabel(plan._id)}`, color: "dim" },
-							],
-						},
-						{
-							spans: () => [
-								{ text: () => (plan.enabled ? "[启用]" : "[已禁用]"), color: plan.enabled ? "success" : "warning" },
 							],
 						},
 					],
@@ -1241,13 +1236,13 @@ export class PricingDrawer implements Component {
 			placeholder: "如：2026.8 价格方案",
 			validate: (value) => this.validateNewName("plans", value),
 			onSubmit: (name) => {
-				this.session.tx.plans.insertOne({ name: name.trim(), enabled: true, ruleIds: [] });
+				this.session.tx.plans.insertOne({ name: name.trim(), ruleIds: [] });
 				this.lastMessage = `已新建方案「${name.trim()}」`;
 			},
 		});
 	}
 
-	/** 方案详情：别名 / 启停 / 规则 / 反向引用 / 改名 / 删除 */
+	/** 方案详情：别名 / 规则 / 反向引用 / 改名 / 删除 */
 	private buildPlanDetailPage(planId: string): Page {
 		const find = () => this.session.schema.plans.find((p) => p._id === planId);
 		return new ActionMenu(
@@ -1259,15 +1254,6 @@ export class PricingDrawer implements Component {
 					label: () => `别名：${find()?.alias ?? "无"}`,
 					detail: () => "用于 HUD 显示，尽可能短；留空清除",
 					run: () => this.editPlanAlias(planId),
-				},
-				{
-					id: "plan:toggle",
-					label: () => (find()?.enabled ? "禁用该方案" : "启用该方案"),
-					detail: () => `当前：${find()?.enabled ? "启用" : "已禁用"}`,
-					run: () => {
-						const plan = find();
-						if (plan) this.session.tx.plans.updateOne(planId, { enabled: !plan.enabled });
-					},
 				},
 				{
 					id: "plan:rules",
@@ -1379,14 +1365,17 @@ export class PricingDrawer implements Component {
 			this.theme,
 			"引用此方案的模型",
 			() => {
-				const bound: MenuEntry[] = this.planModels(planId).map((label) => ({
-					id: `bound:${label}`,
-					label: () => label,
-					detail: () => "已绑定（如需改绑请到该模型）",
-					run: () => {
-						this.lastMessage = `${label} 已绑定本方案`;
-					},
-				}));
+				const bound: MenuEntry[] = this.session.schema.models
+					.filter((m) => m.planId === planId)
+					.map((m) => {
+						const label = `${m.provider}/${m.model}`;
+						return {
+							id: `bound:${m._id}`,
+							label: () => label,
+							detail: () => "Enter 从本方案移除该模型的计费记录",
+							run: () => this.removeModelFromPlan(m._id, label),
+						};
+					});
 				bound.push({
 					id: "plan:add-model",
 					label: () => "＋添加模型",
@@ -1396,6 +1385,22 @@ export class PricingDrawer implements Component {
 				return bound;
 			},
 			() => this.pop(),
+		);
+	}
+
+	/** 从方案移除模型（= 删除该模型的计费记录；v5 模型必须绑方案，不存在"未绑定"态） */
+	private removeModelFromPlan(modelId: string, label: string): void {
+		this.push(
+			this.buildConfirmPage(`从本方案移除 ${label}？`, () => {
+				const doc = this.session.schema.models.find((m) => m._id === modelId);
+				if (!doc) {
+					this.pop();
+					return;
+				}
+				this.session.tx.models.deleteOne(modelId);
+				this.pop(); // 回模型列表
+				this.lastMessage = `已移除 ${label} 的计费记录`;
+			}),
 		);
 	}
 
@@ -1410,7 +1415,7 @@ export class PricingDrawer implements Component {
 			const other = this.session.schema.plans.find((p) => p._id === existing.planId);
 			this.lastMessage = `${ref.provider}/${ref.id} 已绑定方案「${other?.name ?? "未知"}」，请先到该模型改绑`;
 		} else {
-			this.session.tx.models.insertOne({ provider: ref.provider, model: ref.id, planId });
+			this.session.tx.models.insertOne({ provider: ref.provider, model: ref.id, planId, enabled: true });
 			this.lastMessage = `已把 ${ref.provider}/${ref.id} 绑定到「${plan.name}」`;
 		}
 		this.pop(); // 回模型搜索上一层

@@ -54,7 +54,7 @@ test("动作一致性：PRICING_ACTION_KINDS 每个 kind 都有分发分支（�
 		upsertRule: { kind: "upsertRule", name: "一致性规则", rateName: "一致性价" },
 		deleteRule: { kind: "deleteRule", name: "一致性规则" },
 		upsertPlan: { kind: "upsertPlan", name: "一致性方案", ruleNames: [] },
-		setPlanEnabled: { kind: "setPlanEnabled", name: "一致性方案", enabled: false },
+		setModelEnabled: { kind: "setModelEnabled", provider: "p", model: "m", enabled: false },
 		deletePlan: { kind: "deletePlan", name: "一致性方案" },
 		unbindModel: { kind: "unbindModel", provider: "p", model: "m" },
 		bindModel: { kind: "bindModel", provider: "p", model: "m", planName: "一致性方案" },

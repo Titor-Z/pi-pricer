@@ -60,14 +60,14 @@ Pi 生态的模型计费数据共享中心。职责边界：**只负责规则的
   "version": 5,
   "rates": [
     { "_id": "084160217307451e", "createdAt": "...",
-      "name": "DeepSeek 谷价", "inputMiss": 1, "inputHit": 0.02, "output": 4 }
+      "name": "DeepSeek-v4-flash 谷价", "inputMiss": 1, "inputHit": 0.02, "output": 4 }
   ],
   "calendars": [
     { "_id": "366c21606bf01df0", "createdAt": "...",
       "name": "中国法定节假日", "region": "CN", "dates": ["01-01", "10-01"] }
   ],
   "rules": [
-    { "_id": "...", "createdAt": "...", "name": "DeepSeek 工作日高峰",
+    { "_id": "...", "createdAt": "...", "name": "DeepSeek-v4-flash 工作日高峰",
       "rateId": "...", "timezone": "Asia/Shanghai",
       "weekdays": [1,2,3,4,5], "ranges": [["09:00","12:00"],["14:00","18:00"]],
       "includeCalendars": [], "excludeCalendars": [],
@@ -75,12 +75,12 @@ Pi 生态的模型计费数据共享中心。职责边界：**只负责规则的
       "validUntil": "2026-12-31" }
   ],
   "plans": [
-    { "_id": "...", "createdAt": "...", "name": "deepseek-flash 方案",
-      "alias": "Flash 默认", "enabled": true, "ruleIds": ["...", "..."] }
+    { "_id": "...", "createdAt": "...", "name": "deepseek-v4-flash 方案",
+      "alias": "Flash 默认", "ruleIds": ["...", "..."] }
   ],
   "models": [
     { "_id": "...", "createdAt": "...",
-      "provider": "deepseek", "model": "deepseek-flash", "planId": "..." }
+      "provider": "deepseek", "model": "deepseek-v4-flash", "planId": "...", "enabled": true }
   ]
 }
 ```
@@ -92,10 +92,10 @@ Pi 生态的模型计费数据共享中心。职责边界：**只负责规则的
 | `rates` | `name`（唯一）、`inputMiss`、`inputHit`、`output` | — |
 | `calendars` | `name`（唯一）、`region?`、`dates`（`YYYY-MM-DD` 或 `MM-DD`） | — |
 | `rules` | `name`（唯一）、`rateId`、`timezone`、`weekdays`、`ranges`、`includeCalendars`、`excludeCalendars`、`includeDates`、`excludeDates`、`validUntil?` | `rateId → rates._id`；`*Calendars → calendars._id` |
-| `plans` | `name`（唯一）、`alias?`、`enabled`、`ruleIds` | `ruleIds → rules._id`（集合，可空） |
-| `models` | `provider`、`model`、`planId` | `planId → plans._id`；`(provider, model)` 唯一 |
+| `plans` | `name`（唯一）、`alias?`、`ruleIds` | `ruleIds → rules._id`（集合，可空） |
+| `models` | `provider`、`model`、`planId`、`enabled` | `planId → plans._id`；`(provider, model)` 唯一 |
 
-- **模型 → 方案为单值绑定**：一个模型任一时刻只对接一个方案；方案可启用/禁用。
+- **模型 → 方案为单值绑定**：一个模型任一时刻只对接一个方案；**启用/禁用是模型级**（`model.enabled`），只影响该模型，不影响同方案其它模型。
 - **方案 ↔ 规则**：`plan.ruleIds` 表示"包含哪些规则"，**不是优先级**（优先级由 `createdAt` 决定）。
 - **方案允许为空**（`ruleIds: []`）：先建方案、再逐步纳入规则；空方案解析时走兜底价。
 
@@ -122,7 +122,7 @@ Pi 生态的模型计费数据共享中心。职责边界：**只负责规则的
 ```
 resolvePricing(model, provider?, timestamp?, filePath?)
   1. models 查 (provider, model) → planId；无模型 → 兜底价
-  2. plans 查 planId；缺失或 enabled=false → 兜底价
+  2. planId 查方案：缺失 → 兜底价；model.enabled=false → 兜底价（仅本模型）
   3. plan.ruleIds → rules，按 createdAt 升序评估
   4. 单条规则匹配 = 各条件的「交集」（全部成立才命中）：
        validUntil 过期 → 否
@@ -175,7 +175,7 @@ db.begin(): 返回可长期持有的事务（AI 草稿），由调用方 commit 
 | `/price rate` | 价格表 CRUD（`list / add / set / remove`） |
 | `/price calendar` | 日历表 CRUD（`list / add / add-dates / remove`） |
 | `/price rule` | 规则 CRUD（`list / add / remove`，`add` 支持 `--weekdays/--ranges/--include-cal/--exclude-cal/--include-dates/--exclude-dates/--valid-until/--timezone`） |
-| `/price plan` | 方案 CRUD（`list / add / set-alias / add-rule / remove-rule / enable / disable / bind / remove`） |
+| `/price plan` | 方案 CRUD（`list / add / set-alias / add-rule / remove-rule / bind / enable-model / disable-model / remove`） |
 | `/price ai` | 会话级启用 AI 编辑模式（`on / off`） |
 
 - 名称含空格用双引号包裹：`/price rate add "促销价" 0.5 0.01 2`。
@@ -193,7 +193,7 @@ db.begin(): 返回可长期持有的事务（AI 草稿），由调用方 commit 
 根页：模型列表（字母序，行内 `模型@厂商  → [方案名@别名]  [状态]`）；面包屑 `模型`
   ├ Enter 模型 → 模型详情（只与方案打交道）
   │    ├ 方案：<name>（Enter 从方案表选，改绑）
-  │    ├ 禁用 / 启用该方案（plan.enabled）
+  │    ├ 禁用 / 启用该模型（model.enabled，仅本模型）
   │    └ 删除该方案（若有其它模型在用则拒绝）
   └ ＋添加新的模型计费
        └ 检索模型（关键字输入子页）→ 分页候选列表（8 条/页，PgUp/PgDn）
@@ -201,7 +201,7 @@ db.begin(): 返回可长期持有的事务（AI 草稿），由调用方 commit 
 
 统一导航规则：**需要进一步选择 / 输入 / 确认的行一律进子页**（`选择价格` / `编辑时区` /
 `编辑星期` / `编辑时段` / `切换包含日历` / `重命名` / `确认删除` …）；只有当场可判定的
-单一开关（方案启用/禁用）就地生效。绝不再出现「有的进子页、有的弹窗」——面包屑永远回答
+单一开关（模型启用/禁用）就地生效。绝不再出现「有的进子页、有的弹窗」——面包屑永远回答
 “我在第几层”
 
 四张管理表不在根页入口，由参数直达：
@@ -209,7 +209,7 @@ db.begin(): 返回可长期持有的事务（AI 草稿），由调用方 commit 
        ├ 价格表 → 列表 + 新建 → 价格详情（三个数值 / 改名 / 删除）
        ├ 日历表 → 列表 + 新建 → 日历详情（改名 / 日期增删 / 删除）
        ├ 规则表 → 卡片式列表（4 条/页）+ 新建 → 规则详情（价格/时区/星期/时段/含排日历/指定排除日期/有效期/改名/删除）
-       └ 方案表 → 列表 + 新建 → 方案详情（别名/启停/规则增删/引用此方案的模型+添加模型/改名/删除）
+       └ 方案表 → 列表 + 新建 → 方案详情（别名/规则增删/引用此方案的模型+添加模型/改名/删除）
 ```
 
 底部状态栏统一一行，**放在抽屉框内**（内容与底边框之间，上方空一行）：
@@ -299,15 +299,16 @@ db.begin(): 返回可长期持有的事务（AI 草稿），由调用方 commit 
 
 ### 开关语义
 
-- **方案级 `plan.enabled`**：关掉后，凡绑定该方案的模型都走兜底价。
-- 模型本身不再有独立开关（早期曾设 `model.enabled`，已删除）：模型只对接方案。
-- 模型页与方案页都可切换方案的启停（同一状态）。
+- **模型级 `model.enabled`**：在模型详情页禁用某模型，**只影响该模型**（走兜底价），
+  绑定同一方案的其它模型不受影响。
+- 方案本身没有开关：一个方案被哪些模型用、各自启停由模型文档决定。
+- CLI 对应 `/price plan disable-model <provider> <model>`（及 `enable-model`）。
 
 ## AI 辅助配置
 
 - 12 个语义动作（`pricing-agent-actions.ts`）：`upsertRate / deleteRate /
   upsertCalendar / addCalendarDates / deleteCalendar / upsertRule / deleteRule /
-  upsertPlan / setPlanEnabled / deletePlan / bindModel / unbindModel`。
+  upsertPlan / setModelEnabled / deletePlan / bindModel / unbindModel`。
   引用一律用 `name`，agent 无需处理 `_id`。
 - 5 个工具（`pricing-agent-tool.ts`）：`price_get / price_apply / price_review /
   price_save / price_discard`。

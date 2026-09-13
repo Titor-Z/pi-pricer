@@ -40,28 +40,28 @@ const IDLE = new Date("2026-09-15T13:00:00Z");
 const SUN = new Date("2026-09-20T04:00:00Z");
 
 test("resolve：峰时段命中峰价、非峰/周末命中谷价（后创建覆盖先创建）", () => {
-	const peak = resolvePricing("deepseek-flash", "deepseek", PEAK, SEED_PATH);
+	const peak = resolvePricing("deepseek-v4-flash", "deepseek", PEAK, SEED_PATH);
 	assert.equal(peak.output, 8, "峰时输出价");
 	assert.equal(peak.isPeak, true, "命中带时间窗的规则");
-	assert.equal(peak.planName, "deepseek-flash 方案");
+	assert.equal(peak.planName, "deepseek-v4-flash 方案");
 	assert.equal(peak.planAlias, "Flash 默认");
 	assert.ok(peak.ruleId && peak.rateId, "应带出规则/价格来源 _id");
 
-	const idle = resolvePricing("deepseek-flash", "deepseek", IDLE, SEED_PATH);
+	const idle = resolvePricing("deepseek-v4-flash", "deepseek", IDLE, SEED_PATH);
 	assert.equal(idle.output, 4, "非峰输出价");
 	assert.equal(idle.isPeak, false);
 	assert.notEqual(idle.ruleId, peak.ruleId, "不同时段命中不同规则");
 
-	const sun = resolvePricing("deepseek-flash", "deepseek", SUN, SEED_PATH);
+	const sun = resolvePricing("deepseek-v4-flash", "deepseek", SUN, SEED_PATH);
 	assert.equal(sun.output, 4, "周末走谷价");
 });
 
 test("resolve：命中链按创建顺序、可看到覆盖过程", () => {
-	const dbg = resolveDebug("deepseek-flash", "deepseek", PEAK, SEED_PATH);
+	const dbg = resolveDebug("deepseek-v4-flash", "deepseek", PEAK, SEED_PATH);
 	assert.equal(dbg.matched, true);
 	// 兜底规则先创建、峰规则后创建 → 链序：谷 → 峰
-	assert.equal(dbg.chain[0].ruleName, "DeepSeek 全时谷价");
-	assert.equal(dbg.chain[1].ruleName, "DeepSeek 工作日高峰");
+	assert.equal(dbg.chain[0].ruleName, "DeepSeek-v4-flash 全时谷价");
+	assert.equal(dbg.chain[1].ruleName, "DeepSeek-v4-flash 工作日高峰");
 	assert.ok(dbg.chain.every((step) => step.matched), "峰时应两条都命中");
 });
 
@@ -72,19 +72,21 @@ test("resolve：未知模型 / 未绑定模型 → 兜底价", () => {
 	assert.equal(unknown.isPeak, false);
 });
 
-test("resolve：方案禁用 → 兜底价，且命中链说明原因", () => {
+test("resolve：模型禁用 → 兜底价，且命中链说明原因", () => {
 	const dir = tmpDir();
 	const p = join(dir, "m.json");
 	const db = Database.open(p);
-	const plan = db.plans.findOne((x) => x.name === "deepseek-flash 方案");
+	const model = db.models.findOne((x) => x.model === "deepseek-v4-flash");
 	db.transaction((tx) => {
-		tx.plans.updateOne(plan._id, { enabled: false });
+		tx.models.updateOne(model._id, { enabled: false });
 	});
-	const price = resolvePricing("deepseek-flash", "deepseek", PEAK, p);
-	assert.equal(price.output, 4, "禁用方案走兜底");
+	const price = resolvePricing("deepseek-v4-flash", "deepseek", PEAK, p);
+	assert.equal(price.output, 4, "禁用模型走兜底");
 	assert.equal(price.planId, undefined);
-	const dbg = resolveDebug("deepseek-flash", "deepseek", PEAK, p);
-	assert.ok(dbg.chain.some((s) => s.reason.includes("已禁用")), "链应说明方案禁用");
+	// 同方案的别名模型不受影响（仍命中方案，而非兜底）
+	assert.ok(resolvePricing("deepseek-flash", "deepseek", PEAK, p).planId, "同方案别名模型仍命中方案");
+	const dbg = resolveDebug("deepseek-v4-flash", "deepseek", PEAK, p);
+	assert.ok(dbg.chain.some((s) => s.reason.includes("已禁用")), "链应说明模型禁用");
 	rmSync(dir, { recursive: true, force: true });
 });
 
@@ -92,13 +94,13 @@ test("resolve：规则有效期过期 → 该规则不参与匹配", () => {
 	const dir = tmpDir();
 	const p = join(dir, "m.json");
 	const db = Database.open(p);
-	const plan = db.plans.findOne((x) => x.name === "deepseek-flash 方案");
-	const peakRule = db.rules.findOne((r) => r.name === "DeepSeek 工作日高峰");
+	const plan = db.plans.findOne((x) => x.name === "deepseek-v4-flash 方案");
+	const peakRule = db.rules.findOne((r) => r.name === "DeepSeek-v4-flash 工作日高峰");
 	db.transaction((tx) => {
 		// 让峰规则在 2026-09-14 到期 → 9-15 峰时不再命中峰价
 		tx.rules.updateOne(peakRule._id, { validUntil: "2026-09-14" });
 	});
-	const price = resolvePricing("deepseek-flash", "deepseek", PEAK, p);
+	const price = resolvePricing("deepseek-v4-flash", "deepseek", PEAK, p);
 	assert.equal(price.output, 4, "过期峰规则失效 → 谷价");
 	assert.equal(plan._id, price.planId, "仍属同一方案");
 	rmSync(dir, { recursive: true, force: true });
@@ -124,14 +126,14 @@ test("resolve：日历 include（仅节假日生效）与 exclude（节假日排
 			includeDates: [],
 			excludeDates: [],
 		});
-		const plan = tx.plans.findOne((x) => x.name === "deepseek-flash 方案");
+		const plan = tx.plans.findOne((x) => x.name === "deepseek-v4-flash 方案");
 		tx.plans.updateOne(plan._id, { ruleIds: [...plan.ruleIds, rule._id] });
 		return cal._id;
 	});
 	assert.ok(calId);
-	const onPromo = resolvePricing("deepseek-flash", "deepseek", PEAK, p);
+	const onPromo = resolvePricing("deepseek-v4-flash", "deepseek", PEAK, p);
 	assert.equal(onPromo.output, 1, "促销日命中促销价（覆盖峰价）");
-	const offPromo = resolvePricing("deepseek-flash", "deepseek", SUN, p);
+	const offPromo = resolvePricing("deepseek-v4-flash", "deepseek", SUN, p);
 	assert.equal(offPromo.output, 4, "非促销日（周日）走谷价（include 日历不满足）");
 
 	// 再验证 exclude：把促销规则改成"排除促销日" → 促销日不再命中
@@ -139,23 +141,25 @@ test("resolve：日历 include（仅节假日生效）与 exclude（节假日排
 		const rule = tx.rules.findOne((r) => r.name === "促销规则");
 		tx.rules.updateOne(rule._id, { includeCalendars: [], excludeCalendars: [calId] });
 	});
-	const excluded = resolvePricing("deepseek-flash", "deepseek", PEAK, p);
+	const excluded = resolvePricing("deepseek-v4-flash", "deepseek", PEAK, p);
 	assert.equal(excluded.output, 8, "促销日被排除 → 回到峰价");
 	rmSync(dir, { recursive: true, force: true });
 });
 
 test("resolve：createPricingResolver 批量闭包（含数字时间戳与兜底）", () => {
 	const resolver = createPricingResolver(SEED_PATH);
-	assert.equal(resolver("deepseek-flash", "deepseek", PEAK).output, 8);
-	assert.equal(resolver("deepseek-flash", "deepseek", IDLE).output, 4);
-	assert.equal(resolver("deepseek-flash", "deepseek", PEAK.getTime()).output, 8, "数字时间戳应支持");
+	assert.equal(resolver("deepseek-v4-flash", "deepseek", PEAK).output, 8);
+	assert.equal(resolver("deepseek-v4-flash", "deepseek", IDLE).output, 4);
+	assert.equal(resolver("deepseek-v4-flash", "deepseek", PEAK.getTime()).output, 8, "数字时间戳应支持");
 	assert.equal(resolver("unknown", "deepseek", PEAK).output, 4, "未知模型兜底");
 });
 
-test("resolve：种子默认数据自洽（每条规则的 rateId 可解析）", () => {
+test("resolve：种子默认数据自洽（每个模型都命中真实方案，而非兜底价）", () => {
 	const resolver = createPricingResolver(SEED_PATH);
 	for (const model of DEFAULT_PRICING.models) {
 		const price = resolver(model.model, model.provider, PEAK);
+		// 必须命中所绑方案：模型 id / provider 写错时会落到兜底价（planName 为空）
+		assert.ok(price.planName, `${model.provider}/${model.model} 应命中方案（而非兜底价）`);
 		assert.ok(price.output > 0, `${model.provider}/${model.model} 应解析出价格`);
 	}
 });

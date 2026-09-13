@@ -68,8 +68,6 @@ export interface PlanDoc extends Document {
 	name: string;
 	/** 别名：HUD/footer 短名（可选） */
 	alias?: string;
-	/** 是否启用；禁用后绑定它的模型走兜底价 */
-	enabled: boolean;
 	/** 引用的规则 _id 列表（集合 = 该方案包含的规则） */
 	ruleIds: string[];
 }
@@ -82,6 +80,8 @@ export interface ModelDoc extends Document {
 	model: string;
 	/** 绑定的方案 _id（单值） */
 	planId: string;
+	/** 是否启用；禁用后**仅该模型**走兜底价（不影响同方案其它模型） */
+	enabled: boolean;
 }
 
 // ── 根结构 ────────────────────────────────────────────────────────────────

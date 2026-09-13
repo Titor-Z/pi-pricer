@@ -169,12 +169,13 @@ function resolveSteps(schema: PricingSchema, model: string, provider: string, da
 	if (!modelDoc) {
 		return { price: { ...FALLBACK_PRICE }, chain, matched: false };
 	}
-	const planDoc = schema.plans.find((p) => p._id === modelDoc.planId);
-	if (!planDoc) {
+	// 启用/禁用是**模型级**：只影响当前模型，同方案的其它模型不受影响
+	if (modelDoc.enabled === false) {
+		chain.push({ ruleId: "", ruleName: "", rateId: "", matched: false, reason: `${provider}/${model} 已禁用` });
 		return { price: { ...FALLBACK_PRICE }, chain, matched: false };
 	}
-	if (!planDoc.enabled) {
-		chain.push({ ruleId: "", ruleName: "", rateId: "", matched: false, reason: `方案「${planDoc.name}」已禁用` });
+	const planDoc = schema.plans.find((p) => p._id === modelDoc.planId);
+	if (!planDoc) {
 		return { price: { ...FALLBACK_PRICE }, chain, matched: false };
 	}
 

@@ -28,13 +28,17 @@ function tmpDir() {
 function mockPi() {
 	const commands = new Map();
 	const active = new Set(["read", "write"]);
+	/** 记录每次 setActiveTools 的原始入参（保留重复，供断言） */
+	const setCalls = [];
 	return {
 		commands,
 		active,
+		setCalls,
 		registerCommand: (name, options) => commands.set(name, options),
 		registerTool: () => {},
 		getActiveTools: () => [...active],
 		setActiveTools: (names) => {
+			setCalls.push([...names]);
 			active.clear();
 			for (const n of names) active.add(n);
 		},
@@ -60,6 +64,17 @@ async function run(pi, ctx, args) {
 	return ctx.notes[ctx.notes.length - 1];
 }
 
+test("命令：/price ai 重复启用不产生重复工具名（Tool names must be unique）", async () => {
+	const pi = mockPi();
+	new PricingCommands().mount(pi);
+	pi.active.add("price_get"); // 模拟 active 已经包含该工具
+	const ctx = mockCtx({ confirm: true });
+	await run(pi, ctx, "ai on");
+	const last = pi.setCalls[pi.setCalls.length - 1];
+	assert.equal(new Set(last).size, last.length, "传给 setActiveTools 的名字不应重复");
+	assert.ok(last.includes("price_get") && last.includes("price_apply"), "应包含全部 AI 工具");
+});
+
 test("命令：挂载后 6 个命令面齐备，help 不含已删命令", () => {
 	const pi = mockPi();
 	new PricingCommands().mount(pi);
@@ -82,9 +97,9 @@ test("命令：无参列出已设定方案的模型（字母序 + 厂商标注�
 	new PricingCommands(join(dir, "m.json")).mount(pi);
 	const ctx = mockCtx();
 	const note = await run(pi, ctx, "");
-	assert.ok(note.message.includes("deepseek/deepseek-flash"), "应列出模型");
+	assert.ok(note.message.includes("deepseek/deepseek-v4-flash"), "应列出模型");
 	assert.ok(note.message.includes("Flash 默认"), "应显示方案别名");
-	const order = ["deepseek/deepseek-flash", "deepseek/deepseek-v4-pro", "glm/glm-5.3-flash"];
+	const order = ["deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro", "zai/glm-5.3-flash"];
 	const positions = order.map((label) => note.message.indexOf(label));
 	assert.deepEqual(positions, [...positions].sort((a, b) => a - b), "应按字母序");
 	rmSync(dir, { recursive: true, force: true });
@@ -117,10 +132,10 @@ test("命令：rate remove 被规则引用时拒绝（引用保护）", async ()
 	const pi = mockPi();
 	new PricingCommands(path).mount(pi);
 	const ctx = mockCtx();
-	const note = await run(pi, ctx, 'rate remove "DeepSeek 谷价"');
+	const note = await run(pi, ctx, 'rate remove "DeepSeek-v4-flash 谷价"');
 	assert.equal(note.type, "error", "应报错");
 	assert.ok(note.message.includes("仍被规则"), "应说明引用者");
-	assert.ok(readPricing(path).rates.some((r) => r.name === "DeepSeek 谷价"), "不应删除");
+	assert.ok(readPricing(path).rates.some((r) => r.name === "DeepSeek-v4-flash 谷价"), "不应删除");
 	rmSync(dir, { recursive: true, force: true });
 });
 
@@ -141,7 +156,7 @@ test("命令：calendar add + add-dates + rule add（含星期/时段/日历引�
 	await run(
 		pi,
 		ctx,
-		'rule add "国庆促销" "DeepSeek 谷价" --weekdays 1-5 --ranges 09:00-12:00,14:00-18:00 --include-cal "促销日"',
+		'rule add "国庆促销" "DeepSeek-v4-flash 谷价" --weekdays 1-5 --ranges 09:00-12:00,14:00-18:00 --include-cal "促销日"',
 	);
 	const rule = readPricing(path).rules.find((r) => r.name === "国庆促销");
 	assert.deepEqual(rule.weekdays, [1, 2, 3, 4, 5]);
@@ -165,21 +180,22 @@ test("命令：plan add / add-rule / bind / disable / list（含反向引用）"
 	await run(pi, ctx, 'plan add "新策略" "新策略HUD"');
 	const plan = readPricing(path).plans.find((p) => p.name === "新策略");
 	assert.equal(plan.alias, "新策略HUD");
-	assert.equal(plan.enabled, true);
+	assert.equal("enabled" in plan, false, "方案不应再有启停字段");
 
-	await run(pi, ctx, 'plan add-rule "新策略" "DeepSeek 全时谷价"');
+	await run(pi, ctx, 'plan add-rule "新策略" "DeepSeek-v4-flash 全时谷价"');
 	assert.equal(readPricing(path).plans.find((p) => p.name === "新策略").ruleIds.length, 1);
 
 	await run(pi, ctx, 'plan bind testprov testmodel "新策略"');
 	const model = readPricing(path).models.find((m) => m.provider === "testprov");
 	assert.ok(model, "应创建模型绑定");
+	assert.equal(model.enabled, true, "新绑定默认启用");
 
-	await run(pi, ctx, 'plan disable "新策略"');
-	assert.equal(readPricing(path).plans.find((p) => p.name === "新策略").enabled, false);
+	await run(pi, ctx, 'plan disable-model testprov testmodel');
+	assert.equal(readPricing(path).models.find((m) => m.provider === "testprov").enabled, false);
 
 	const listNote = await run(pi, ctx, "plan list");
-	assert.ok(listNote.message.includes("已禁用"), "列表应标注禁用");
 	assert.ok(listNote.message.includes("testprov/testmodel"), "列表应显示反向引用");
+	assert.ok(renderModelList(readPricing(path)).includes("[已禁用]"), "模型列表应标注禁用");
 
 	// 被绑定 → 拒删
 	const deny = await run(pi, ctx, 'plan remove "新策略"');
@@ -195,11 +211,11 @@ test("命令：plan remove-rule 可清空规则、remove 未绑定可删", async
 	new PricingCommands(path).mount(pi);
 	const ctx = mockCtx();
 
-	// 种子方案 deepseek-flash 有 2 条规则：可逐条移出（允许空方案）
-	await run(pi, ctx, 'plan remove-rule "deepseek-flash 方案" "DeepSeek 全时谷价"');
-	assert.equal(readPricing(path).plans.find((p) => p.name === "deepseek-flash 方案").ruleIds.length, 1);
-	await run(pi, ctx, 'plan remove-rule "deepseek-flash 方案" "DeepSeek 工作日高峰"');
-	assert.equal(readPricing(path).plans.find((p) => p.name === "deepseek-flash 方案").ruleIds.length, 0, "允许清空规则");
+	// 种子方案 deepseek-v4-flash 有 2 条规则：可逐条移出（允许空方案）
+	await run(pi, ctx, 'plan remove-rule "deepseek-v4-flash 方案" "DeepSeek-v4-flash 全时谷价"');
+	assert.equal(readPricing(path).plans.find((p) => p.name === "deepseek-v4-flash 方案").ruleIds.length, 1);
+	await run(pi, ctx, 'plan remove-rule "deepseek-v4-flash 方案" "DeepSeek-v4-flash 工作日高峰"');
+	assert.equal(readPricing(path).plans.find((p) => p.name === "deepseek-v4-flash 方案").ruleIds.length, 0, "允许清空规则");
 
 	// 新建未被引用的方案可删（含空方案）
 	await run(pi, ctx, 'plan add "临时方案"');
@@ -224,8 +240,8 @@ test("命令：补全按层级给候选（子命令 / 动作 / 动态 name）", 
 	const cmd = new PricingCommands(join(dir, "m.json"));
 	assert.ok(cmd.completions("r").some((c) => c.value === "rate"), "一级：r → rate");
 	assert.ok(cmd.completions("rate ").some((c) => c.value === "add"), "二级：rate → add");
-	assert.ok(cmd.completions("rate set ").some((c) => c.label === "DeepSeek 谷价"), "三级：价格名");
-	assert.ok(cmd.completions("rate set \"DeepSeek").some((c) => c.value.includes("DeepSeek 谷价")), "含空格 name 应加引号");
+	assert.ok(cmd.completions("rate set ").some((c) => c.label === "DeepSeek-v4-flash 谷价"), "三级：价格名");
+	assert.ok(cmd.completions("rate set \"DeepSeek").some((c) => c.value.includes("DeepSeek-v4-flash 谷价")), "含空格 name 应加引号");
 	assert.equal(cmd.completions("bogus ").length, 0, "未知子命令无候选");
 	rmSync(dir, { recursive: true, force: true });
 });
@@ -250,11 +266,11 @@ test("命令：/price ai on|off 切换激活工具集；headless 拒绝", async 
 	rmSync(dir, { recursive: true, force: true });
 });
 
-test("命令：renderModelList 对启用/禁用方案的标注", () => {
+test("命令：renderModelList 对启用/禁用模型的标注", () => {
 	const dir = tmpDir();
 	const schema = readPricing(join(dir, "m.json"));
 	assert.ok(renderModelList(schema).includes("[启用]"), "默认种子应标注启用");
-	const disabled = { ...schema, plans: schema.plans.map((p) => ({ ...p, enabled: false })) };
-	assert.ok(renderModelList(disabled).includes("[已禁用]"), "禁用方案应标注已禁用");
+	const disabled = { ...schema, models: schema.models.map((m) => ({ ...m, enabled: false })) };
+	assert.ok(renderModelList(disabled).includes("[已禁用]"), "禁用模型应标注已禁用");
 	rmSync(dir, { recursive: true, force: true });
 });

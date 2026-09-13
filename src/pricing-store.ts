@@ -13,6 +13,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { PricingSchema } from "./pricing-types.ts";
 import { DEFAULT_PRICING } from "./pricing-defaults.ts";
+import { migrateSchema } from "./pricing-migrate.ts";
 
 /** 默认文件路径（~/.pi/model-pricing.json） */
 export const DEFAULT_PRICING_PATH = join(homedir(), ".pi", "model-pricing.json");
@@ -50,7 +51,7 @@ export function readPricing(filePath: string = DEFAULT_PRICING_PATH): PricingSch
 	} catch {
 		return cloneDefaults();
 	}
-	return isV5(data) ? data : cloneDefaults();
+	return isV5(data) ? migrateSchema(data) : cloneDefaults();
 }
 
 /** 写入配置（创建目录 + 原子写：临时文件 → rename） */

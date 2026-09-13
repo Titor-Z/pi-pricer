@@ -105,7 +105,7 @@ test("抽屉：根页只列模型（字母序）；四张管理表由参数直�
 	const { component } = await open(join(dir, "m.json"));
 	const lines = component.render(80);
 	const out = lines.join("\n");
-	const order = ["deepseek-flash@deepseek", "deepseek-v4-pro@deepseek", "glm-5.3-flash@glm"];
+	const order = ["deepseek-v4-flash@deepseek", "deepseek-v4-pro@deepseek", "glm-5.3-flash@zai"];
 	const positions = order.map((label) => out.indexOf(label));
 	assert.deepEqual(positions, [...positions].sort((a, b) => a - b), "模型应字母序");
 	// 面包屑：顶边框 → 面包屑 → 空行；根页面包屑为「模型」
@@ -113,8 +113,8 @@ test("抽屉：根页只列模型（字母序）；四张管理表由参数直�
 	assert.ok(lines[1].includes("模型") && !lines[1].includes("deepseek"), "第二行应是根页面包屑");
 	assert.equal(lines[2], "", "面包屑下方应有一个空行");
 	// 列对齐：两个数据行的方案列起始位置应一致
-	const rowFlash = lines.find((line) => line.includes("deepseek-flash@deepseek"));
-	const rowGlm = lines.find((line) => line.includes("glm-5.3-flash@glm"));
+	const rowFlash = lines.find((line) => line.includes("deepseek-v4-flash@deepseek"));
+	const rowGlm = lines.find((line) => line.includes("glm-5.3-flash@zai"));
 	assert.equal(rowFlash.indexOf("→"), rowGlm.indexOf("→"), "方案列应对齐");
 	// 「＋添加」上方空行
 	const addIndex = lines.findIndex((line) => line.includes("＋添加新的模型计费"));
@@ -128,31 +128,31 @@ test("抽屉：根页只列模型（字母序）；四张管理表由参数直�
 	rmSync(dir, { recursive: true, force: true });
 });
 
-test("抽屉：模型详情只与方案打交道（禁用方案 / 删除方案）", async () => {
+test("抽屉：模型详情禁用该模型（仅影响本模型） / 删除方案", async () => {
 	const dir = tmpDir();
 	const path = join(dir, "m.json");
 	const { component } = await open(path);
 
-	component.handleInput(ENTER); // 进入 deepseek-flash@deepseek
+	component.handleInput(ENTER); // 进入首行（字母序：deepseek-flash@deepseek）
 	let detail = text(component);
-	assert.ok(detail.includes("方案：deepseek-flash 方案"), "应显示当前方案");
+	assert.ok(detail.includes("方案：deepseek-v4-flash 方案"), "应显示当前方案");
 	assert.ok(!detail.includes("规则"), "模型详情不应出现规则管理");
-	assert.ok(detail.includes("禁用该方案"), "应可禁用方案");
+	assert.ok(detail.includes("禁用该模型"), "应可禁用模型");
 
 	component.handleInput(DOWN); // 移到开关项
-	component.handleInput(ENTER); // 禁用方案
+	component.handleInput(ENTER); // 禁用模型
 	detail = text(component);
-	assert.ok(detail.includes("启用该方案"), "应变为可启用");
+	assert.ok(detail.includes("启用该模型"), "应变为可启用");
 	assert.ok(text(component).includes("● 未保存改动"), "应标记未保存");
 
 	component.handleInput(CTRL_S);
 	await settle(component);
-	const saved = readPricing(path).plans.find((p) => p.name === "deepseek-flash 方案");
-	assert.equal(saved.enabled, false, "方案启停应落盘");
+	const saved = readPricing(path).models.find((m) => m.model === "deepseek-flash");
+	assert.equal(saved.enabled, false, "模型启停应落盘");
 
-	// 另一模型用别的方案，不受影响
-	const other = readPricing(path).plans.find((p) => p.name === "deepseek-v4-pro 方案");
-	assert.equal(other.enabled, true, "其他方案不受影响");
+	// 同方案的别名模型不受影响
+	const sibling = readPricing(path).models.find((m) => m.model === "deepseek-v4-flash");
+	assert.equal(sibling.enabled, true, "同方案其它模型不受影响");
 	rmSync(dir, { recursive: true, force: true });
 });
 
@@ -160,7 +160,7 @@ test("抽屉：新增模型计费（检索 → 选方案）", async () => {
 	const dir = tmpDir();
 	const path = join(dir, "m.json");
 	const availableModels = [
-		{ provider: "deepseek", id: "deepseek-flash" },
+		{ provider: "deepseek", id: "deepseek-v4-flash" },
 		{ provider: "acme", id: "acme-1" },
 	];
 	const { component } = await openWith(path, { availableModels });
@@ -210,7 +210,7 @@ test("抽屉：方案页给方案添加模型；已绑其它方案则拒绝", as
 	];
 	const { component } = await openWith(path, { initial: "plan", availableModels });
 
-	assert.ok(moveTo(component, "deepseek-flash 方案"), "应能找到方案");
+	assert.ok(moveTo(component, "deepseek-v4-flash 方案"), "应能找到方案");
 	component.handleInput(ENTER);
 	assert.ok(moveTo(component, "引用此方案的模型"), "应能找到反向引用项");
 	component.handleInput(ENTER);
@@ -243,6 +243,7 @@ test("抽屉：更换方案改绑并落盘；Ctrl+R 丢弃改动", async () => {
 	const path = join(dir, "m.json");
 	const { component } = await open(path);
 
+	assert.ok(moveTo(component, "deepseek-v4-flash@deepseek"), "应定位到 deepseek-v4-flash");
 	component.handleInput(ENTER); // 进入模型
 	component.handleInput(ENTER); // 进入"方案"项 → 选择方案页
 	const chooser = text(component);
@@ -257,7 +258,7 @@ test("抽屉：更换方案改绑并落盘；Ctrl+R 丢弃改动", async () => {
 	component.handleInput(CTRL_S);
 	await settle(component);
 	assert.equal(
-		readPricing(path).models.find((m) => m.model === "deepseek-flash").planId,
+		readPricing(path).models.find((m) => m.model === "deepseek-v4-flash").planId,
 		readPricing(path).plans.find((p) => p.name.includes("glm-5.3-flash"))._id,
 		"改绑应落盘",
 	);
@@ -272,7 +273,7 @@ test("抽屉：更换方案改绑并落盘；Ctrl+R 丢弃改动", async () => {
 	component.handleInput(CTRL_R);
 	assert.ok(text(component).includes("✓ 已保存"), "重置后应回净");
 	assert.equal(
-		readPricing(path).models.find((m) => m.model === "deepseek-flash").planId,
+		readPricing(path).models.find((m) => m.model === "deepseek-v4-flash").planId,
 		readPricing(path).plans.find((p) => p.name.includes("glm-5.3-flash"))._id,
 		"重置后磁盘保持上次保存值",
 	);
@@ -352,10 +353,10 @@ test("抽屉：面包屑层级 / 超宽折叠 / 弹窗期间隐藏", async () =>
 	assert.ok(crumb.includes("模型") && crumb.includes("方案"), "直达面包屑应为 模型 › 方案");
 
 	// 进入方案详情 → 三级
-	assert.ok(moveTo(component, "deepseek-flash 方案"));
+	assert.ok(moveTo(component, "deepseek-v4-flash 方案"));
 	component.handleInput(ENTER);
 	crumb = component.render(80)[1];
-	assert.ok(crumb.includes("模型") && crumb.includes("方案") && crumb.includes("deepseek-flash 方案"), "应显示三级面包屑");
+	assert.ok(crumb.includes("模型") && crumb.includes("方案") && crumb.includes("deepseek-v4-flash 方案"), "应显示三级面包屑");
 
 	// 进入「引用此方案的模型」→ 四级
 	assert.ok(moveTo(component, "引用此方案的模型"));
@@ -385,7 +386,7 @@ test("价格页：列表 + 新建；改数值就地校验并落盘", async () =>
 	const dir = tmpDir();
 	const path = join(dir, "m.json");
 	const { component } = await open(path, "rate");
-	assert.ok(text(component).includes("DeepSeek 谷价"), "应列出已有价格");
+	assert.ok(text(component).includes("DeepSeek-v4-flash 谷价"), "应列出已有价格");
 
 	// 新建价格（列表页动态反映）
 	assert.ok(moveTo(component, "＋新建价格"), "应能找到新建入口");
@@ -416,7 +417,7 @@ test("价格页：列表 + 新建；改数值就地校验并落盘", async () =>
 test("价格页：非法数值被拦截（不关窗、不丢输入）", async () => {
 	const dir = tmpDir();
 	const { component } = await open(join(dir, "m.json"), "rate");
-	assert.ok(moveTo(component, "DeepSeek 谷价"));
+	assert.ok(moveTo(component, "DeepSeek-v4-flash 谷价"));
 	component.handleInput(ENTER);
 	assert.ok(moveTo(component, "输出价"));
 	component.handleInput(ENTER);
@@ -432,7 +433,7 @@ test("价格页：非法数值被拦截（不关窗、不丢输入）", async ()
 test("价格页：删除被规则引用时拒绝并提示", async () => {
 	const dir = tmpDir();
 	const { component } = await open(join(dir, "m.json"), "rate");
-	assert.ok(moveTo(component, "DeepSeek 谷价"));
+	assert.ok(moveTo(component, "DeepSeek-v4-flash 谷价"));
 	component.handleInput(ENTER);
 	assert.ok(moveTo(component, "删除该价格"));
 	component.handleInput(ENTER);
@@ -446,7 +447,7 @@ test("规则页：列表 + 新建（名称 → 选价格）", async () => {
 	const dir = tmpDir();
 	const path = join(dir, "m.json");
 	const { component } = await open(path, "rule");
-	assert.ok(text(component).includes("DeepSeek 工作日高峰"), "应列出已有规则");
+	assert.ok(text(component).includes("DeepSeek-v4-flash 工作日高峰"), "应列出已有规则");
 
 	assert.ok(moveTo(component, "＋新建规则"));
 	component.handleInput(ENTER);
@@ -456,7 +457,7 @@ test("规则页：列表 + 新建（名称 → 选价格）", async () => {
 	component.handleInput(ENTER); // 选第一个价格
 	assert.ok(text(component).includes("测试规则"), "新建后列表应出现");
 	// 规则表为卡片式：标题一行 + `→ 价格 · 星期 · 时段` 一行；每页 5 条
-	assert.ok(text(component).includes("→ DeepSeek 谷价 · 每天 · 全天"), "卡片摘要应含 价格 · 星期 · 时段");
+	assert.ok(text(component).includes("→ DeepSeek-v4-flash 谷价 · 每天 · 全天"), "卡片摘要应含 价格 · 星期 · 时段");
 	assert.ok(text(component).includes("第 2/2 页"), "规则表每页 4 条（7 个条目 → 2 页）");
 	component.handleInput("\x1b[5~"); // PageUp
 	assert.ok(text(component).includes("第 1/2 页"), "PgUp 应回到首页");
@@ -476,7 +477,7 @@ test("规则详情：星期多选 + 时段增删 + 有效期，并落盘", async
 	const path = join(dir, "m.json");
 	const { component } = await open(path, "rule");
 
-	assert.ok(moveTo(component, "DeepSeek 工作日高峰"));
+	assert.ok(moveTo(component, "DeepSeek-v4-flash 工作日高峰"));
 	component.handleInput(ENTER);
 	assert.ok(text(component).includes("星期：周一 周二 周三 周四 周五"), "应显示当前星期");
 
@@ -505,7 +506,7 @@ test("规则详情：星期多选 + 时段增删 + 有效期，并落盘", async
 
 	component.handleInput(CTRL_S);
 	await settle(component);
-	const saved = readPricing(path).rules.find((r) => r.name === "DeepSeek 工作日高峰");
+	const saved = readPricing(path).rules.find((r) => r.name === "DeepSeek-v4-flash 工作日高峰");
 	assert.deepEqual(saved.ranges, [["14:00", "18:00"]], "时段应落盘");
 	assert.equal(saved.validUntil, "2026-12-31", "有效期应落盘");
 	rmSync(dir, { recursive: true, force: true });
@@ -516,7 +517,7 @@ test("规则详情：日历包含切换 + 非法时点拦截 + 删除引用保�
 	const path = join(dir, "m.json");
 	const { component } = await open(path, "rule");
 
-	assert.ok(moveTo(component, "DeepSeek 工作日高峰"));
+	assert.ok(moveTo(component, "DeepSeek-v4-flash 工作日高峰"));
 	component.handleInput(ENTER);
 
 	// 时段非法：起点晚于终点
@@ -545,8 +546,9 @@ test("方案页：列表反向引用 + 新建", async () => {
 	const path = join(dir, "m.json");
 	const { component } = await open(path, "plan");
 	const list = text(component);
-	assert.ok(list.includes("deepseek-flash 方案"), "应列出方案");
-	assert.ok(list.includes("被 deepseek/deepseek-flash 引用"), "应显示反向引用");
+	assert.ok(list.includes("deepseek-v4-flash 方案"), "应列出方案");
+	assert.ok(list.includes("被 deepseek/deepseek-v4"), "应显示反向引用（截断后仍可辨）");
+	assert.ok(list.includes("被 zai/glm-5.3-flash 引用"), "GLM 反向引用应用 pi 真实 provider");
 
 	assert.ok(moveTo(component, "＋新建方案"));
 	component.handleInput(ENTER);
@@ -560,15 +562,15 @@ test("方案页：列表反向引用 + 新建", async () => {
 	rmSync(dir, { recursive: true, force: true });
 });
 
-test("方案详情：别名 / 启停 / 规则增删，并落盘", async () => {
+test("方案详情：别名 / 规则增删，并落盘", async () => {
 	const dir = tmpDir();
 	const path = join(dir, "m.json");
 	const { component } = await open(path, "plan");
 
-	assert.ok(moveTo(component, "deepseek-flash 方案"));
+	assert.ok(moveTo(component, "deepseek-v4-flash 方案"));
 	component.handleInput(ENTER);
 	assert.ok(text(component).includes("规则（2 条）"), "应显示规则数");
-	assert.ok(text(component).includes("禁用该方案"), "应可禁用");
+	assert.ok(!text(component).includes("禁用该方案"), "方案详情不应再有启停项");
 
 	// 设别名（弹窗预填原别名，先清空）
 	assert.ok(moveTo(component, "别名："), "应能找到别名项");
@@ -578,33 +580,51 @@ test("方案详情：别名 / 启停 / 规则增删，并落盘", async () => {
 	component.handleInput(ENTER);
 	assert.ok(text(component).includes("别名：新HUD"), "别名应更新");
 
-	// 禁用方案
-	assert.ok(moveTo(component, "禁用该方案"));
-	component.handleInput(ENTER);
-	assert.ok(text(component).includes("启用该方案"), "应变为可启用");
-
 	// 移出一条规则
 	assert.ok(moveTo(component, "规则（2 条）"));
 	component.handleInput(ENTER);
 	component.handleInput(ENTER); // 移出当前第一条
-	assert.ok(!body(component).includes("DeepSeek 全时谷价"), "已移出的规则不应再列出");
-	assert.ok(body(component).includes("DeepSeek 工作日高峰"), "剩余规则仍在");
+	assert.ok(!body(component).includes("DeepSeek-v4-flash 全时谷价"), "已移出的规则不应再列出");
+	assert.ok(body(component).includes("DeepSeek-v4-flash 工作日高峰"), "剩余规则仍在");
 	assert.ok(moveTo(component, "＋添加规则"), "应有添加入口");
 	component.handleInput(ESC);
 
 	component.handleInput(CTRL_S);
 	await settle(component);
-	const saved = readPricing(path).plans.find((p) => p.name === "deepseek-flash 方案");
+	const saved = readPricing(path).plans.find((p) => p.name === "deepseek-v4-flash 方案");
 	assert.equal(saved.alias, "新HUD", "别名应落盘");
-	assert.equal(saved.enabled, false, "启停应落盘");
 	assert.equal(saved.ruleIds.length, 1, "规则增删应落盘");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("方案详情：从方案移除模型绑定（删除 ModelDoc）并落盘", async () => {
+	const dir = tmpDir();
+	const path = join(dir, "m.json");
+	const { component } = await open(path, "plan");
+
+	assert.ok(moveTo(component, "deepseek-v4-flash 方案"));
+	component.handleInput(ENTER);
+	assert.ok(moveTo(component, "引用此方案的模型"), "应有模型入口");
+	component.handleInput(ENTER);
+	assert.ok(text(component).includes("deepseek/deepseek-v4-flash"), "应列出已绑定模型");
+
+	assert.ok(moveTo(component, "deepseek/deepseek-v4-flash"));
+	component.handleInput(ENTER); // 进入确认页
+	assert.ok(text(component).includes("从本方案移除"), "应弹出移除确认");
+	assert.ok(moveTo(component, "确认执行"));
+	component.handleInput(ENTER);
+	assert.ok(!body(component).includes("deepseek/deepseek-v4-flash"), "移除后不应再列出");
+
+	component.handleInput(CTRL_S);
+	await settle(component);
+	assert.ok(!readPricing(path).models.some((m) => m.model === "deepseek-v4-flash"), "移除应落盘");
 	rmSync(dir, { recursive: true, force: true });
 });
 
 test("方案页：删除被模型绑定时拒绝", async () => {
 	const dir = tmpDir();
 	const { component } = await open(join(dir, "m.json"), "plan");
-	assert.ok(moveTo(component, "deepseek-flash 方案"));
+	assert.ok(moveTo(component, "deepseek-v4-flash 方案"));
 	component.handleInput(ENTER);
 	assert.ok(moveTo(component, "删除该方案"));
 	component.handleInput(ENTER);

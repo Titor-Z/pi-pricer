@@ -100,6 +100,6 @@ test("端到端：headless（print）下 /price 回退文本列表", async () =>
 	new PricingCommands(join(dir, "m.json")).mount(pi);
 	const ctx = { mode: "print", hasUI: false, ui: { notify: (message, type) => notes.push({ message, type }), custom: async () => undefined } };
 	await pi._cmd.handler("", ctx);
-	assert.ok(notes.some((n) => n.message.includes("deepseek/deepseek-flash")), "应回退文本模型列表");
+	assert.ok(notes.some((n) => n.message.includes("deepseek/deepseek-v4-flash")), "应回退文本模型列表");
 	rmSync(dir, { recursive: true, force: true });
 });

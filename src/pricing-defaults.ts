@@ -98,19 +98,19 @@ function rule(partial: {
 
 /** 构造方案文档 */
 function plan(id: string, seq: number, name: string, alias: string, ruleIds: string[]): PlanDoc {
-	return { _id: id, createdAt: seedTime(seq), name, alias, enabled: true, ruleIds };
+	return { _id: id, createdAt: seedTime(seq), name, alias, ruleIds };
 }
 
-/** 构造模型文档 */
+/** 构造模型文档（启用/禁用是模型级，不影响同方案其它模型） */
 function model(seq: number, provider: string, modelName: string, planId: string): ModelDoc {
-	return { _id: sid(seq), createdAt: seedTime(seq), provider, model: modelName, planId };
+	return { _id: sid(seq), createdAt: seedTime(seq), provider, model: modelName, planId, enabled: true };
 }
 
 // ── 种子 ──────────────────────────────────────────────────────────────────
 
 const rates: RateDoc[] = [
-	rate(RATE_DS_VALLEY, 1, "DeepSeek 谷价", 1, 0.02, 4),
-	rate(RATE_DS_PEAK, 2, "DeepSeek 峰价", 2, 0.04, 8),
+	rate(RATE_DS_VALLEY, 1, "DeepSeek-v4-flash 谷价", 1, 0.02, 4),
+	rate(RATE_DS_PEAK, 2, "DeepSeek-v4-flash 峰价", 2, 0.04, 8),
 	rate(RATE_DS_PRO_VALLEY, 3, "DeepSeek Pro 谷价", 4.5, 0.15, 13.5),
 	rate(RATE_DS_PRO_PEAK, 4, "DeepSeek Pro 峰价", 9, 0.3, 27),
 	rate(RATE_GLM_STANDARD, 5, "GLM 标准价", 0.8, 0.23, 2.8),
@@ -123,11 +123,11 @@ const calendars: CalendarDoc[] = [];
  * 解析按 createdAt 升序评估、后命中覆盖先命中 → 峰时段内峰价覆盖谷价，其余时间谷价生效。
  */
 const rules: RuleDoc[] = [
-	rule({ id: RULE_DS_VALLEY_ALWAYS, seq: 11, name: "DeepSeek 全时谷价", rateId: RATE_DS_VALLEY }),
+	rule({ id: RULE_DS_VALLEY_ALWAYS, seq: 11, name: "DeepSeek-v4-flash 全时谷价", rateId: RATE_DS_VALLEY }),
 	rule({
 		id: RULE_DS_PEAK_WORKDAY,
 		seq: 12,
-		name: "DeepSeek 工作日高峰",
+		name: "DeepSeek-v4-flash 工作日高峰",
 		rateId: RATE_DS_PEAK,
 		weekdays: WORKDAY_PEAK_WEEKDAYS,
 		ranges: WORKDAY_PEAK_RANGES,
@@ -145,15 +145,18 @@ const rules: RuleDoc[] = [
 ];
 
 const plans: PlanDoc[] = [
-	plan(PLAN_DS_FLASH, 21, "deepseek-flash 方案", "Flash 默认", [RULE_DS_VALLEY_ALWAYS, RULE_DS_PEAK_WORKDAY]),
+	plan(PLAN_DS_FLASH, 21, "deepseek-v4-flash 方案", "Flash 默认", [RULE_DS_VALLEY_ALWAYS, RULE_DS_PEAK_WORKDAY]),
 	plan(PLAN_DS_V4_PRO, 22, "deepseek-v4-pro 方案", "Pro 默认", [RULE_DS_PRO_VALLEY_ALWAYS, RULE_DS_PRO_PEAK_WORKDAY]),
 	plan(PLAN_GLM_FLASH, 23, "glm-5.3-flash 方案", "GLM 默认", [RULE_GLM_ALWAYS]),
 ];
 
 const models: ModelDoc[] = [
-	model(31, "deepseek", "deepseek-flash", PLAN_DS_FLASH),
+	// DeepSeek Flash 双别名：官方推荐名 deepseek-flash + pi 注册表旧名 deepseek-v4-flash
+	// （官方说明旧名仍可调用、按 Flash 价计费；绑同一方案，多模型共用）
+	model(31, "deepseek", "deepseek-v4-flash", PLAN_DS_FLASH),
+	model(34, "deepseek", "deepseek-flash", PLAN_DS_FLASH),
 	model(32, "deepseek", "deepseek-v4-pro", PLAN_DS_V4_PRO),
-	model(33, "glm", "glm-5.3-flash", PLAN_GLM_FLASH),
+	model(33, "zai", "glm-5.3-flash", PLAN_GLM_FLASH),
 ];
 
 /** v5 内置种子（调用方须深拷贝后再改，避免污染本常量） */

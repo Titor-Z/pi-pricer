@@ -127,7 +127,6 @@ export function applyAction(tx: Transaction, action: PricingAction): void {
 			const existing = schema.plans.find((p) => p.name === action.name);
 			const fields = {
 				name: action.name,
-				enabled: action.enabled ?? true,
 				ruleIds: action.ruleNames === undefined && existing ? existing.ruleIds : ruleIds,
 				...(action.alias ? { alias: action.alias } : {}),
 			};
@@ -135,10 +134,10 @@ export function applyAction(tx: Transaction, action: PricingAction): void {
 			else tx.plans.insertOne(fields);
 			return;
 		}
-		case "setPlanEnabled": {
-			const plan = tx.plans.findOne((p) => p.name === action.name);
-			if (!plan) throw new Error(`方案「${action.name}」不存在`);
-			tx.plans.updateOne(plan._id, { enabled: action.enabled });
+		case "setModelEnabled": {
+			const model = tx.models.findOne((m) => m.provider === action.provider && m.model === action.model);
+			if (!model) throw new Error(`模型 ${action.provider}/${action.model} 未绑定任何方案`);
+			tx.models.updateOne(model._id, { enabled: action.enabled });
 			return;
 		}
 		case "deletePlan": {
@@ -155,7 +154,7 @@ export function applyAction(tx: Transaction, action: PricingAction): void {
 			if (!plan) throw new Error(`方案「${action.planName}」不存在`);
 			const existing = tx.models.findOne((m) => m.provider === action.provider && m.model === action.model);
 			if (existing) tx.models.updateOne(existing._id, { planId: plan._id });
-			else tx.models.insertOne({ provider: action.provider, model: action.model, planId: plan._id });
+			else tx.models.insertOne({ provider: action.provider, model: action.model, planId: plan._id, enabled: true });
 			return;
 		}
 		case "unbindModel": {
